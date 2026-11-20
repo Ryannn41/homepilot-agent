@@ -1,8 +1,9 @@
-"""Agent 可调用的工具：当前时间、天气、联网搜索、定时提醒。以进程内 MCP 服务的形式挂到 Agent 上。"""
+"""Agent 可调用的工具：时间日历、天气、联网搜索、计算、定时提醒和简报、计时、备忘清单、发微信。
+以进程内 MCP 服务的形式挂到 Agent 上。"""
 
 import asyncio
 import logging
-from datetime import datetime
+from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
 import httpx
@@ -10,8 +11,12 @@ from claude_agent_sdk import create_sdk_mcp_server, tool
 from claude_agent_sdk.types import McpSdkServerConfig
 from dashscope import Generation
 
+from app.calc import calculate
+from app.cn_calendar import calendar_info, parse_date
 from app.config import Settings
+from app.notes import NoteStore
 from app.reminders import REPEATS, ReminderStore
+from app.wechat import WeChat
 
 log = logging.getLogger(__name__)
 
@@ -29,10 +34,13 @@ WEATHER_CODES = {
     95: "雷阵雨", 96: "雷阵雨伴冰雹", 99: "强雷阵雨伴冰雹",
 }  # fmt: skip
 DAY_NAMES = ("今天", "明天", "后天")
+DEFAULT_LIST = "备忘"
 
 
-def build_tools(settings: Settings, reminders: ReminderStore, device_id: str) -> McpSdkServerConfig:
-    """device_id：提醒属于哪台设备，到点后在这台设备上播放。"""
+def build_tools(
+    settings: Settings, device_id: str, *, reminders: ReminderStore, notes: NoteStore, wechat: WeChat
+) -> McpSdkServerConfig:
+    """device_id：提醒、清单属于哪台设备，提醒到点后在这台设备上播放。"""
     tz = ZoneInfo(settings.timezone)
 
     @tool("get_current_time", "获取当前的日期、星期和时间", {})
@@ -57,33 +65,55 @@ def build_tools(settings: Settings, reminders: ReminderStore, device_id: str) ->
         log.info("调用工具 web_search %s", args)
         return await _run(search(settings, args["query"]))
 
+    schedule_schema = {
+        "time": {"type": "string", "description": "第一次的时间，格式 YYYY-MM-DD HH:MM"},
+        "repeat": {
+            "type": "string",
+            "enum": list(REPEATS),
+            "description": "once 只一次；daily 每天；weekdays 工作日（周一到周五）；weekly 每周（与第一次同一星期几）",
+        },
+    }
+
+    async def schedule(args, kind: str) -> str:
+        at = datetime.strptime(args["time"], "%Y-%m-%d %H:%M").replace(tzinfo=tz)
+        return f"已创建 {reminders.add(device_id, args['content'], at, args['repeat'], kind).describe()}"
+
     @tool(
         "create_reminder",
-        "创建定时提醒，到点后用语音播报；音箱不在线时改发微信。先用 get_current_time 确认现在的时间再计算 time",
+        "创建定时提醒，到点后语音播报并发微信。先用 get_current_time 确认现在的时间再计算 time。"
+        "「N分钟后」这类相对时间用 start_timer",
         {
             "type": "object",
-            "properties": {
-                "content": {"type": "string", "description": "提醒内容，如：开会、吃药"},
-                "time": {"type": "string", "description": "第一次提醒的时间，格式 YYYY-MM-DD HH:MM"},
-                "repeat": {
-                    "type": "string",
-                    "enum": list(REPEATS),
-                    "description": "once 只提醒一次；daily 每天；weekdays 工作日（周一到周五）；weekly 每周（与第一次同一星期几）",
-                },
-            },
+            "properties": {"content": {"type": "string", "description": "提醒内容，如：开会、吃药"}, **schedule_schema},
             "required": ["content", "time", "repeat"],
         },
     )
     async def create_reminder(args):
         log.info("调用工具 create_reminder %s", args)
+        return await _run(schedule(args, "reminder"))
 
-        async def create() -> str:
-            at = datetime.strptime(args["time"], "%Y-%m-%d %H:%M").replace(tzinfo=tz)
-            return f"已创建提醒 {reminders.add(device_id, args['content'], at, args['repeat']).describe()}"
+    @tool(
+        "create_briefing",
+        "创建定时简报，如「每天早上7点给我播报天气和今天的安排」。到点后你会按 content 的要求调用工具"
+        "现场整理一段播报，在音箱播报并发微信。先用 get_current_time 确认现在的时间再计算 time。"
+        "可用 list_reminders / delete_reminder 查看和取消",
+        {
+            "type": "object",
+            "properties": {
+                "content": {
+                    "type": "string",
+                    "description": "到点时要播报什么，写成给你自己的指令，如：播报今天的天气、今天的提醒和购物清单",
+                },
+                **schedule_schema,
+            },
+            "required": ["content", "time", "repeat"],
+        },
+    )
+    async def create_briefing(args):
+        log.info("调用工具 create_briefing %s", args)
+        return await _run(schedule(args, "briefing"))
 
-        return await _run(create())
-
-    @tool("list_reminders", "列出所有定时提醒及编号", {})
+    @tool("list_reminders", "列出所有定时提醒、简报和计时及编号", {})
     async def list_reminders(args):
         log.info("调用工具 list_reminders")
         items = reminders.for_device(device_id)
@@ -95,14 +125,158 @@ def build_tools(settings: Settings, reminders: ReminderStore, device_id: str) ->
         deleted = reminders.delete(device_id, int(args["id"]))
         return _text(f"已删除提醒 #{args['id']}" if deleted else f"没有编号为 {args['id']} 的提醒")
 
+    @tool(
+        "start_timer",
+        "倒计时：「8分钟后叫我」「煮面计时10分钟」这类相对时间用它，不用 create_reminder。"
+        "到点后语音播报并发微信；可用 list_reminders / delete_reminder 查看和取消",
+        {
+            "type": "object",
+            "properties": {
+                "seconds": {"type": "integer", "description": "倒计时秒数，如 8 分钟为 480"},
+                "label": {"type": "string", "description": "计时的事情，如：煮面；用户没说可以不传"},
+            },
+            "required": ["seconds"],
+        },
+    )
+    async def start_timer(args):
+        log.info("调用工具 start_timer %s", args)
+
+        async def start() -> str:
+            seconds = int(args["seconds"])
+            if seconds <= 0:
+                raise ValueError("计时时长必须大于 0")
+            duration = format_duration(seconds)
+            content = f"{args['label']}，{duration}计时到了" if args.get("label") else f"{duration}计时到了"
+            reminder = reminders.add(device_id, content, datetime.now(tz) + timedelta(seconds=seconds), "once")
+            return f"已开始计时 #{reminder.id} {duration}，{reminder.at:%H:%M:%S} 到点"
+
+        return await _run(start())
+
+    @tool(
+        "get_calendar_info",
+        "查询某天的星期、农历、是否放假或调休上班、距今几天。"
+        "例如：下周一上班吗、今天农历几号、离春节还有几天（春节传 农历YYYY-01-01）",
+        {
+            "type": "object",
+            "properties": {
+                "date": {
+                    "type": "string",
+                    "description": "公历 YYYY-MM-DD，或农历 农历YYYY-MM-DD；不传表示今天。先用 get_current_time 确认今天日期",
+                }
+            },
+        },
+    )
+    async def get_calendar_info(args):
+        log.info("调用工具 get_calendar_info %s", args)
+
+        async def info() -> str:
+            today = datetime.now(tz).date()
+            return calendar_info(parse_date(args["date"]) if args.get("date") else today, today)
+
+        return await _run(info())
+
+    @tool(
+        "calculate",
+        "精确计算数学表达式，需要算数时一定用它，不要心算。支持 + - * / // % ** 括号，以及 sqrt abs round log log10",
+        {"expression": str},
+    )
+    async def calculate_tool(args):
+        log.info("调用工具 calculate %s", args)
+
+        async def calc() -> str:
+            return f"{args['expression']} = {calculate(args['expression'])}"
+
+        return await _run(calc())
+
+    list_name_schema = {"type": "string", "description": f"清单名，如：购物清单、待办；默认「{DEFAULT_LIST}」"}
+
+    @tool(
+        "add_note",
+        "往清单里记东西，如「记一下要买牛奶和鸡蛋」",
+        {
+            "type": "object",
+            "properties": {
+                "items": {"type": "array", "items": {"type": "string"}, "description": "要记的条目，每项一件事"},
+                "list": list_name_schema,
+            },
+            "required": ["items"],
+        },
+    )
+    async def add_note(args):
+        log.info("调用工具 add_note %s", args)
+        list_name = args.get("list") or DEFAULT_LIST
+        notes.add(device_id, list_name, args["items"])
+        return _text(f"已记到「{list_name}」，现在有：{'、'.join(notes.lists(device_id, list_name).get(list_name, []))}")
+
+    @tool(
+        "list_notes",
+        "查看清单内容；不传 list 时列出所有清单",
+        {"type": "object", "properties": {"list": {"type": "string", "description": "清单名"}}},
+    )
+    async def list_notes(args):
+        log.info("调用工具 list_notes %s", args)
+        lists = notes.lists(device_id, args.get("list"))
+        return _text("\n".join(f"{name}：{'、'.join(items)}" for name, items in lists.items()) or "清单是空的")
+
+    @tool(
+        "remove_note",
+        "从清单中划掉包含关键词的条目，如「牛奶买了」",
+        {
+            "type": "object",
+            "properties": {"keyword": {"type": "string"}, "list": list_name_schema},
+            "required": ["keyword"],
+        },
+    )
+    async def remove_note(args):
+        log.info("调用工具 remove_note %s", args)
+        list_name = args.get("list") or DEFAULT_LIST
+        removed = notes.remove(device_id, list_name, args["keyword"])
+        return _text(f"已从「{list_name}」划掉：{'、'.join(removed)}" if removed else f"「{list_name}」里没有「{args['keyword']}」")
+
+    @tool(
+        "clear_notes",
+        "清空一个清单",
+        {"type": "object", "properties": {"list": list_name_schema}},
+    )
+    async def clear_notes(args):
+        log.info("调用工具 clear_notes %s", args)
+        list_name = args.get("list") or DEFAULT_LIST
+        return _text(f"已清空「{list_name}」，共 {notes.clear(device_id, list_name)} 条")
+
+    @tool(
+        "send_to_wechat",
+        "把文字发到用户的微信。内容较长或用户需要保存时使用，如菜谱步骤、地址电话、清单、链接；"
+        "发完在语音里只简单说一句已发到微信",
+        {"text": str},
+    )
+    async def send_to_wechat(args):
+        log.info("调用工具 send_to_wechat (%d 字)", len(args["text"]))
+
+        async def send() -> str:
+            await wechat.send(args["text"])
+            return "已发送到微信"
+
+        return await _run(send())
+
     return create_sdk_mcp_server(
         SERVER_NAME,
-        tools=[get_current_time, get_weather, web_search, create_reminder, list_reminders, delete_reminder],
-    )
+        tools=[
+            get_current_time, get_calendar_info, get_weather, web_search, calculate_tool,
+            create_reminder, create_briefing, list_reminders, delete_reminder, start_timer,
+            add_note, list_notes, remove_note, clear_notes, send_to_wechat,
+        ],
+    )  # fmt: skip
 
 
 def format_time(now: datetime) -> str:
     return f"{now:%Y年%m月%d日} 星期{WEEKDAYS[now.weekday()]} {now:%H:%M}"
+
+
+def format_duration(seconds: int) -> str:
+    hours, rest = divmod(seconds, 3600)
+    minutes, seconds = divmod(rest, 60)
+    parts = [f"{hours}小时" if hours else "", f"{minutes}分钟" if minutes else "", f"{seconds}秒" if seconds else ""]
+    return "".join(parts)
 
 
 _places: dict[str, dict] = {}  # 城市名 -> 地理编码结果，城市坐标不会变

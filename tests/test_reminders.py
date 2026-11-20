@@ -22,6 +22,29 @@ def test_next_time():
     assert next_time(friday, "weekly") == datetime(2026, 11, 27, 9, 0, tzinfo=TZ)
 
 
+def test_briefing_kind(store):
+    at = datetime.now(TZ).replace(hour=7, minute=0) + timedelta(days=1)
+    b = store.add("dev", "播报天气和今天的提醒", at, "daily", "briefing")
+    assert store.for_device("dev") == [b] and b.kind == "briefing"
+    assert "07:00 简报：播报天气和今天的提醒" in b.describe()
+    with pytest.raises(ValueError, match="类型"):
+        store.add("dev", "x", at, "daily", "alarm")
+
+
+def test_old_database_gets_kind_column(tmp_path):
+    import sqlite3
+
+    path = tmp_path / "old.db"
+    db = sqlite3.connect(path)
+    db.execute("CREATE TABLE reminders (id INTEGER PRIMARY KEY, device_id TEXT NOT NULL, content TEXT NOT NULL, "
+               "at INTEGER NOT NULL, repeat TEXT NOT NULL)")
+    at = int((datetime.now(TZ) + timedelta(hours=1)).timestamp())
+    db.execute("INSERT INTO reminders (device_id, content, at, repeat) VALUES ('dev', '开会', ?, 'once')", (at,))
+    db.commit()
+    db.close()
+    assert [r.kind for r in ReminderStore(path, TZ).for_device("dev")] == ["reminder"]
+
+
 def test_add_list_delete_by_device(store):
     soon = datetime.now(TZ) + timedelta(hours=1)
     r = store.add("dev1", "开会", soon, "daily")

@@ -39,7 +39,13 @@ DeepSeek 通过它的 Anthropic 兼容接口（`https://api.deepseek.com/anthrop
 | `get_current_time` | 本地计算 | 日期、星期、时间，时区为 `HOMEPILOT_TIMEZONE` |
 | `get_weather` | [Open-Meteo](https://open-meteo.com/)，免费、无需 key | 实时天气和三天预报；没说地点时查 `HOMEPILOT_HOME_CITY`。只支持城市名，不支持区县名 |
 | `web_search` | 通义千问联网搜索（`enable_search`），复用 DashScope key | 返回整理好的事实要点，约 3~5 秒 |
+| `get_calendar_info` | `app/cn_calendar.py`（`chinesecalendar` + `zhdate`），本地计算 | 星期、农历、放假或调休上班、距今几天；支持传农历日期，如春节传 `农历2027-01-01`。节假日数据随 `chinesecalendar` 版本更新，每年底国务院公布安排后升级一次 |
+| `calculate` | `app/calc.py`，基于 `ast` 的安全求值 | 四则运算、乘方和 `sqrt` 等函数，避免模型心算出错 |
 | `create_reminder` / `list_reminders` / `delete_reminder` | `app/reminders.py` | 定时提醒，见下节 |
+| `create_briefing` | 复用提醒的存储和调度 | 定时简报（「每天早上 7 点播报天气、今天的提醒和购物清单」），见下节 |
+| `start_timer` | 复用提醒的存储和调度 | 倒计时（「煮面计时 8 分钟」），按秒计算，到点方式与提醒相同 |
+| `add_note` / `list_notes` / `remove_note` / `clear_notes` | `app/notes.py`，存于 `data/notes.db` | 按设备存放的清单，如购物清单、待办；默认清单名为「备忘」 |
+| `send_to_wechat` | `app/wechat.py` | 把菜谱、地址、清单等长内容发到绑定的微信 |
 
 搜索较慢，系统提示词要求模型在搜索前先说一句「我查一下」，这句话会立即合成播放。工具出错时把原因作为结果返回给模型，由模型告诉用户。
 
@@ -49,13 +55,15 @@ DeepSeek 通过它的 Anthropic 兼容接口（`https://api.deepseek.com/anthrop
 
 对音箱说「每天早上 9 点提醒我开会」，模型调用 `create_reminder`（内容、时间、重复方式：一次 / 每天 / 工作日 / 每周）。提醒按设备存放在 `data/reminders.db`，设备 ID 取自客户端连接时的 `X-Device-Id` 请求头；每台设备只能查询和删除自己的提醒。
 
-服务端每 10 秒检查一次到点的提醒：
+服务端每秒检查一次到点的提醒和倒计时。
 
 到点后音箱和微信同时提醒，任一渠道失败不影响另一个：
 
 - 音箱（设备在线时）：合成「提醒你：开会」，以 `notify.start`、音频帧、`notify.end` 推送给客户端（协议见客户端 `docs/protocol.md`）。客户端如果正在对话，会等当前回复播完再播；播完进入追问状态，用户可以直接回应，Agent 知道刚才播报了什么。
 - 微信：发给已绑定的联系人。
 - 服务停机期间错过的提醒，超过 30 分钟就不再补发；重复提醒顺延到下一次。
+
+定时简报是一种特殊的提醒：存的不是要播报的文字，而是给 Agent 的指令（如「播报今天的天气、今天的提醒和购物清单」）。到点后服务端为这台设备创建一个 Agent，让它调用工具现场整理一段简报（`app/main.py` 中的 `BRIEFING_CONTEXT` 规定了格式），再像普通提醒一样在音箱播报并发到微信。生成约需 5~10 秒，超过 2 分钟视为失败。简报、提醒和倒计时都可以用「有哪些提醒」「删掉 2 号」查看和取消。
 
 ### 绑定微信
 
@@ -104,7 +112,7 @@ cp .env.example .env   # 填入两个 API key
 | `HOMEPILOT_TIMEZONE` | `Asia/Shanghai` | 当前时间工具使用的时区 |
 | `HOMEPILOT_HOME_CITY` | `上海` | 没说地点时查询天气的城市 |
 | `HOMEPILOT_SEARCH_MODEL` | `qwen-flash` | 联网搜索用的通义千问模型；`qwen-plus` 更详细但慢一倍 |
-| `HOMEPILOT_DATA_DIR` | `data` | 提醒数据库和微信登录信息的存放目录 |
+| `HOMEPILOT_DATA_DIR` | `data` | 提醒、清单数据库和微信登录信息的存放目录 |
 | `HOMEPILOT_LOG_LEVEL` | `INFO` | `DEBUG` 时打印收到的每个事件 |
 
 优先级：系统环境变量 > `.env` > 默认值。
@@ -118,6 +126,31 @@ python -m app.main
 Ctrl+C 退出。日志中会打印每一轮的识别文本和逐句回复。
 
 每个语音会话会启动一个 Claude Code CLI 子进程，耗时约 1 秒。这一步在收到 `session.start` 后于后台进行，和用户开口说话的时间重叠，一般感觉不到。
+
+## 部署到云服务器
+
+服务需要常驻运行，定时提醒和微信消息才能按时发出。在 Linux 云服务器上：
+
+```bash
+git clone <仓库地址> homepilot-agent && cd homepilot-agent
+./deploy.sh            # 第一次运行会生成 .env 并停下，填好两个 API key 后再运行一次
+```
+
+`deploy.sh` 可以重复运行，依次完成：
+1. 安装缺少的 `tmux`、`curl`。
+2. 没有 conda 时安装 Miniconda 到 `~/miniconda3`。
+3. 创建 `homepilot_agent` 环境并安装依赖。
+4. 首次运行时生成 `.env`，并随机生成客户端令牌。
+5. 运行单元测试。
+6. 在 tmux 会话 `homepilot` 中启动服务。服务异常退出后 5 秒自动重启，日志写入 `logs/agent.log`。
+
+| 操作 | 命令 |
+| --- | --- |
+| 查看实时日志 | `tmux attach -t homepilot`（Ctrl+B 再按 D 退出，服务继续运行） |
+| 更新代码 | `git pull && ./deploy.sh` |
+| 停止服务 | `./deploy.sh stop` |
+
+部署后还要在云服务器的安全组中放行端口（默认 8000），并把客户端的 `HOMEPILOT_SERVER_URL`、`HOMEPILOT_AUTH_TOKEN` 改成服务器地址和 `.env` 中的令牌。公网部署务必设置令牌，否则任何人都能连接并消耗 API 额度。微信需要在服务器上重新扫码登录和绑定（见「绑定微信」）。
 
 ## 与客户端联调
 
