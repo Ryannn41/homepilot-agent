@@ -1,0 +1,6 @@
+websockets~=17.4
+pydantic-settings~=2.16
+dashscope~=2.1
+claude-agent-sdk~=0.2.185
+pytest~=9.2
+pytest-asyncio~=1.5
