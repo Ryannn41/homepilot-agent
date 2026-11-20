@@ -53,8 +53,8 @@ class FakeRecognizer:
 class FakeAgent:
     instances: list["FakeAgent"] = []
 
-    def __init__(self, settings, sentences=("晴天。", "二十度。"), delay=0.0, error=None):
-        self.sentences, self.delay, self.error = sentences, delay, error
+    def __init__(self, context, sentences=("晴天。", "二十度。"), delay=0.0, error=None):
+        self.context, self.sentences, self.delay, self.error = context, sentences, delay, error
         self.asked: list[str] = []
         self.interrupted = self.closed = False
         FakeAgent.instances.append(self)
@@ -75,7 +75,9 @@ class FakeAgent:
 
 
 async def fake_tts(settings, text):
-    return b"\x01\x00" * (TTS_CHUNK // 2 + 100)  # 两帧：一整帧 + 200 字节
+    # 共 TTS_CHUNK + 200 字节，块长不规则且有奇数：应重新切成一整帧 + 200 字节
+    for size in (1001, TTS_CHUNK - 1001 - 1, 1, 200):
+        yield b"\x01" * size
 
 
 def mic(turn_id: str, seq: int) -> bytes:
@@ -86,9 +88,14 @@ def ev(type_: str, **fields) -> str:
     return json.dumps({"type": type_, "session_id": SESSION, **fields})
 
 
-async def start(agent_factory=FakeAgent):
+def new_session(agent_factory=FakeAgent):
     ws = FakeWebSocket()
-    session = VoiceSession(ws, Settings(), new_recognizer=FakeRecognizer, new_agent=agent_factory, synthesize=fake_tts)
+    session = VoiceSession(ws, Settings(), agent_factory, new_recognizer=FakeRecognizer, synthesize=fake_tts)
+    return ws, session
+
+
+async def start(agent_factory=FakeAgent):
+    ws, session = new_session(agent_factory)
     task = asyncio.create_task(session.run())
     await ws.incoming.put(ev("session.start", device_id="dev", client_version="test"))
     return ws, task
@@ -179,6 +186,40 @@ async def test_new_input_replaces_old_turn_and_drops_stale_frames():
     await wait_for(ws, "response.done")
     await close(ws, task)
     assert {e["turn_id"] for e in ws.events() if e["type"] != "transcript"} == {new}
+
+
+async def test_notify_outside_session():
+    ws, session = new_session()
+    await session.notify("提醒你：开会")
+    start, end = ws.events()
+    assert start == {"type": "notify.start", "notify_id": start["notify_id"], "text": "提醒你：开会", "sample_rate": 16000}
+    assert end == {"type": "notify.end", "notify_id": start["notify_id"], "frames": 2}
+    frames = [unpack_audio(m) for m in ws.sent if isinstance(m, bytes)]
+    assert [(f.kind, f.turn_id, f.seq) for f in frames] == [(KIND_TTS, start["notify_id"], 0), (KIND_TTS, start["notify_id"], 1)]
+
+
+async def test_session_after_notify_gets_notice_context():
+    ws, session = new_session()
+    await session.notify("提醒你：开会")
+    task = asyncio.create_task(session.run())
+    await ws.incoming.put(ev("session.start"))
+    await close(ws, task)
+    assert "提醒你：开会" in FakeAgent.instances[-1].context
+
+
+async def test_notify_during_session_is_told_to_agent_once():
+    ws, session = new_session()
+    task = asyncio.create_task(session.run())
+    await ws.incoming.put(ev("session.start"))
+    await asyncio.sleep(0.02)
+    await session.notify("提醒你：开会")
+    for _ in range(2):
+        await speak(ws, str(uuid.uuid4()))
+        await asyncio.sleep(0.05)
+    await close(ws, task)
+    first, second = FakeAgent.instances[-1].asked
+    assert first == "（刚才你主动播报了定时提醒：提醒你：开会）今天天气怎么样"
+    assert second == "今天天气怎么样"
 
 
 async def test_events_from_other_session_ignored():

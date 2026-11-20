@@ -44,4 +44,5 @@ class Settings(BaseSettings):
     home_city: str = "上海"  # 用户没说地点时查询天气的城市
     search_model: str = "qwen-flash"  # 联网搜索用的通义千问模型（复用 DashScope key）
 
+    data_dir: str = "data"  # 提醒数据库、微信登录状态
     log_level: Literal["DEBUG", "INFO", "WARNING", "ERROR"] = "INFO"

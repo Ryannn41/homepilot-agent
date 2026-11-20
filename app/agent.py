@@ -8,37 +8,42 @@ from collections.abc import AsyncIterator
 from pathlib import Path
 
 from claude_agent_sdk import ClaudeAgentOptions, ClaudeSDKClient, ResultMessage, StreamEvent
+from claude_agent_sdk.types import McpSdkServerConfig
 
 from app.config import Settings
-from app.tools import SERVER_NAME, TOOL_NAMES, build_tools
+from app.tools import ALLOWED_TOOLS, SERVER_NAME
 
-# 句末标点（连续的算一个）；按句切分后可以边生成边合成语音
-_SENTENCE = re.compile(r"[^。！？；!?;\n]*[。！？；!?;\n]+")
+# 句末标点（连续的算一个，紧跟的右引号、右括号也归入本句）；按句切分后可以边生成边合成语音
+_SENTENCE = re.compile(r"[^。！？；!?;\n]*[。！？；!?;\n]+[”’」』）)\"']*")
 
 
 def split_sentences(text: str) -> tuple[list[str], str]:
-    """把 text 切成完整句子和剩余的未完成部分。"""
+    """把 text 切成完整句子和剩余的未完成部分。只有标点的片段会被丢弃，TTS 无法合成它们。"""
     sentences, end = [], 0
     for m in _SENTENCE.finditer(text):
-        if sentence := m.group().strip():
+        if _speakable(sentence := m.group().strip()):
             sentences.append(sentence)
         end = m.end()
     return sentences, text[end:]
 
 
-def _options(settings: Settings) -> ClaudeAgentOptions:
+def _speakable(text: str) -> bool:
+    return re.search(r"\w", text) is not None
+
+
+def _options(settings: Settings, tools: McpSdkServerConfig, context: str) -> ClaudeAgentOptions:
     model = settings.deepseek_model
     # CLI 会把工作目录、git、Shell 等环境信息注入给模型，DeepSeek 看到后会凭空输出 bash 调用；
     # 放在空目录里运行，避免暴露项目信息
     workdir = Path(tempfile.gettempdir()) / "homepilot-agent"
     workdir.mkdir(exist_ok=True)
     return ClaudeAgentOptions(
-        system_prompt=settings.system_prompt,
+        system_prompt=settings.system_prompt + context,
         model=model,
         cwd=workdir,
         tools=[],  # 关闭 Claude Code 内置工具（Bash、Read 等）
-        mcp_servers={SERVER_NAME: build_tools(settings)},
-        allowed_tools=TOOL_NAMES,  # 免确认直接调用
+        mcp_servers={SERVER_NAME: tools},
+        allowed_tools=ALLOWED_TOOLS,
         setting_sources=[],  # 不读取 ~/.claude 等本机设置，避免覆盖下面的接口配置
         include_partial_messages=True,
         env={
@@ -54,8 +59,9 @@ def _options(settings: Settings) -> ClaudeAgentOptions:
 class Agent:
     """同一个会话内多轮对话共享上下文。"""
 
-    def __init__(self, settings: Settings):
-        self._client = ClaudeSDKClient(_options(settings))
+    def __init__(self, settings: Settings, tools: McpSdkServerConfig, context: str = ""):
+        """tools：app.tools.build_tools() 构造的工具；context：追加到系统提示词的会话背景。"""
+        self._client = ClaudeSDKClient(_options(settings, tools, context))
         # 启动 CLI 子进程约需 1 秒，在后台进行，不阻塞音频接收
         self._connecting = asyncio.create_task(self._client.connect())
         self._unfinished = False  # 上一轮回复被取消时还没读完
@@ -79,7 +85,7 @@ class Agent:
                 self._unfinished = False
                 if msg.is_error:
                     raise RuntimeError(f"模型调用失败: {msg.errors or msg.result or msg.subtype}")
-        if buffer.strip():
+        if _speakable(buffer):
             yield buffer.strip()
 
     async def interrupt(self) -> None:

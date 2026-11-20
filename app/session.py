@@ -1,7 +1,11 @@
-"""一个 WebSocket 连接对应一个 VoiceSession：接收客户端事件和麦克风音频，编排 ASR -> Agent -> TTS。"""
+"""一个 WebSocket 连接对应一个 VoiceSession：接收客户端事件和麦克风音频，编排 ASR -> Agent -> TTS；
+也负责向这台设备推送定时提醒。"""
 
 import asyncio
 import logging
+import time
+import uuid
+from collections.abc import AsyncIterator, Callable
 from contextlib import suppress
 
 from websockets.exceptions import ConnectionClosed
@@ -15,15 +19,27 @@ from app.protocol import KIND_MIC, ProtocolError, event, pack_audio, parse_event
 log = logging.getLogger(__name__)
 
 TTS_CHUNK = SAMPLE_RATE * 2 // 10  # 下行每帧 100ms PCM16
+NOTICE_CONTEXT_S = 120  # 提醒播报后这么久内开始的会话，会带上提醒内容作为背景
 
 
 class VoiceSession:
-    def __init__(self, ws, settings: Settings, *, new_recognizer=Recognizer, new_agent=Agent, synthesize=tts.synthesize):
+    def __init__(
+        self,
+        ws,
+        settings: Settings,
+        new_agent: Callable[[str], Agent],
+        *,
+        new_recognizer=Recognizer,
+        synthesize=tts.synthesize,
+    ):
+        """new_agent(context)：为每个会话创建 Agent，context 追加到系统提示词。"""
         self._ws = ws
         self._settings = settings
         self._new_recognizer = new_recognizer
         self._new_agent = new_agent
         self._synthesize = synthesize
+        self._last_notice: tuple[float, str] | None = None  # (monotonic 时间, 提醒文字)
+        self._unheard_notices: list[str] = []  # 会话进行中播报、Agent 还不知道的提醒
 
         self._session_id: str | None = None
         self._agent: Agent | None = None
@@ -58,7 +74,7 @@ class VoiceSession:
         if type_ == "session.start":
             await self._end_session()
             self._session_id = msg.get("session_id")
-            self._agent = self._new_agent(self._settings)
+            self._agent = self._new_agent(self._notice_context())
             log.info("会话开始 %s device=%s", self._session_id, msg.get("device_id"))
         elif msg.get("session_id") != self._session_id:
             log.warning("忽略非当前会话的事件 %s", type_)
@@ -107,23 +123,49 @@ class VoiceSession:
             log.info("用户: %s", text)
             await self._send(turn_id, "transcript", text=text, final=True)
             if text:
+                if self._unheard_notices:
+                    notices, self._unheard_notices = "；".join(self._unheard_notices), []
+                    text = f"（刚才你主动播报了定时提醒：{notices}）{text}"
                 async for sentence in agent.ask(text):
                     log.info("回复: %s", sentence)
                     await self._send(turn_id, "response.text", text=sentence)
-                    await self._send_audio(turn_id, await self._synthesize(self._settings, sentence))
+                    await self._send_audio(turn_id, self._synthesize(self._settings, sentence))
             await self._send(turn_id, "response.done")
         except Exception as e:
             log.exception("turn %s 处理失败", turn_id)
             await self._send(turn_id, "error", code="internal_error", message=str(e))
 
-    async def _send_audio(self, turn_id: str, pcm: bytes) -> None:
-        pcm = pcm[: len(pcm) // 2 * 2]
-        chunks = [pcm[i : i + TTS_CHUNK] for i in range(0, len(pcm), TTS_CHUNK)]
+    async def notify(self, text: str) -> None:
+        """主动推送一条提醒，不属于任何会话。连接已断开时抛出 ConnectionClosed。"""
+        notify_id = str(uuid.uuid4())
+        await self._ws.send(event("notify.start", None, notify_id=notify_id, text=text, sample_rate=SAMPLE_RATE))
+        frames = await self._send_frames(notify_id, self._synthesize(self._settings, text))
+        await self._ws.send(event("notify.end", None, notify_id=notify_id, frames=frames))
+        self._last_notice = (time.monotonic(), text)
+        if self._agent is not None:
+            self._unheard_notices.append(text)
+
+    async def _send_audio(self, turn_id: str, audio: AsyncIterator[bytes]) -> None:
         await self._send(turn_id, "response.audio.start", sample_rate=SAMPLE_RATE)
-        for seq, chunk in enumerate(chunks):
-            with suppress(ConnectionClosed):
-                await self._ws.send(pack_audio(turn_id, seq, chunk))
-        await self._send(turn_id, "response.audio.end", frames=len(chunks))
+        frames = await self._send_frames(turn_id, audio)
+        await self._send(turn_id, "response.audio.end", frames=frames)
+
+    async def _send_frames(self, frame_id: str, audio: AsyncIterator[bytes]) -> int:
+        """边合成边发送一段语音，重新切成 100ms 的帧，返回帧数。"""
+        buffer, seq = b"", 0
+        async for data in audio:
+            buffer += data
+            while len(buffer) >= TTS_CHUNK:
+                await self._send_frame(frame_id, seq, buffer[:TTS_CHUNK])
+                buffer, seq = buffer[TTS_CHUNK:], seq + 1
+        if tail := buffer[: len(buffer) // 2 * 2]:
+            await self._send_frame(frame_id, seq, tail)
+            seq += 1
+        return seq
+
+    async def _send_frame(self, turn_id: str, seq: int, pcm: bytes) -> None:
+        with suppress(ConnectionClosed):
+            await self._ws.send(pack_audio(turn_id, seq, pcm))
 
     async def _send(self, turn_id: str | None, type_: str, **fields) -> None:
         # 连接断开时由 run() 统一清理，这里不必报错
@@ -142,8 +184,15 @@ class VoiceSession:
         self._reply = None
         self._turn_id = None
 
+    def _notice_context(self) -> str:
+        """提醒播完后客户端会开新会话等用户回应，让 Agent 知道刚才播报了什么。"""
+        if self._last_notice is None or time.monotonic() - self._last_notice[0] > NOTICE_CONTEXT_S:
+            return ""
+        return f"\n刚才你主动播报了一条定时提醒：「{self._last_notice[1]}」，用户接下来的话可能是在回应它。"
+
     async def _end_session(self) -> None:
         await self._cancel_turn()
+        self._unheard_notices.clear()
         if self._agent is not None:
             agent, self._agent = self._agent, None
             try:

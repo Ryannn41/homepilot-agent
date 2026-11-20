@@ -1,4 +1,4 @@
-"""Agent 可调用的工具：当前时间、天气、联网搜索。以进程内 MCP 服务的形式挂到 Agent 上。"""
+"""Agent 可调用的工具：当前时间、天气、联网搜索、定时提醒。以进程内 MCP 服务的形式挂到 Agent 上。"""
 
 import asyncio
 import logging
@@ -11,11 +11,12 @@ from claude_agent_sdk.types import McpSdkServerConfig
 from dashscope import Generation
 
 from app.config import Settings
+from app.reminders import REPEATS, ReminderStore
 
 log = logging.getLogger(__name__)
 
 SERVER_NAME = "home"
-TOOL_NAMES = [f"mcp__{SERVER_NAME}__{name}" for name in ("get_current_time", "get_weather", "web_search")]
+ALLOWED_TOOLS = [f"mcp__{SERVER_NAME}"]  # 该服务下的所有工具免确认
 
 WEEKDAYS = "一二三四五六日"
 # Open-Meteo 使用的 WMO 天气代码
@@ -30,11 +31,14 @@ WEATHER_CODES = {
 DAY_NAMES = ("今天", "明天", "后天")
 
 
-def build_tools(settings: Settings) -> McpSdkServerConfig:
+def build_tools(settings: Settings, reminders: ReminderStore, device_id: str) -> McpSdkServerConfig:
+    """device_id：提醒属于哪台设备，到点后在这台设备上播放。"""
+    tz = ZoneInfo(settings.timezone)
+
     @tool("get_current_time", "获取当前的日期、星期和时间", {})
     async def get_current_time(args):
         log.info("调用工具 get_current_time")
-        return _text(format_time(datetime.now(ZoneInfo(settings.timezone))))
+        return _text(format_time(datetime.now(tz)))
 
     @tool(
         "get_weather",
@@ -53,7 +57,48 @@ def build_tools(settings: Settings) -> McpSdkServerConfig:
         log.info("调用工具 web_search %s", args)
         return await _run(search(settings, args["query"]))
 
-    return create_sdk_mcp_server(SERVER_NAME, tools=[get_current_time, get_weather, web_search])
+    @tool(
+        "create_reminder",
+        "创建定时提醒，到点后用语音播报；音箱不在线时改发微信。先用 get_current_time 确认现在的时间再计算 time",
+        {
+            "type": "object",
+            "properties": {
+                "content": {"type": "string", "description": "提醒内容，如：开会、吃药"},
+                "time": {"type": "string", "description": "第一次提醒的时间，格式 YYYY-MM-DD HH:MM"},
+                "repeat": {
+                    "type": "string",
+                    "enum": list(REPEATS),
+                    "description": "once 只提醒一次；daily 每天；weekdays 工作日（周一到周五）；weekly 每周（与第一次同一星期几）",
+                },
+            },
+            "required": ["content", "time", "repeat"],
+        },
+    )
+    async def create_reminder(args):
+        log.info("调用工具 create_reminder %s", args)
+
+        async def create() -> str:
+            at = datetime.strptime(args["time"], "%Y-%m-%d %H:%M").replace(tzinfo=tz)
+            return f"已创建提醒 {reminders.add(device_id, args['content'], at, args['repeat']).describe()}"
+
+        return await _run(create())
+
+    @tool("list_reminders", "列出所有定时提醒及编号", {})
+    async def list_reminders(args):
+        log.info("调用工具 list_reminders")
+        items = reminders.for_device(device_id)
+        return _text("\n".join(r.describe() for r in items) if items else "没有任何提醒")
+
+    @tool("delete_reminder", "按编号删除定时提醒；不知道编号时先调用 list_reminders", {"id": int})
+    async def delete_reminder(args):
+        log.info("调用工具 delete_reminder %s", args)
+        deleted = reminders.delete(device_id, int(args["id"]))
+        return _text(f"已删除提醒 #{args['id']}" if deleted else f"没有编号为 {args['id']} 的提醒")
+
+    return create_sdk_mcp_server(
+        SERVER_NAME,
+        tools=[get_current_time, get_weather, web_search, create_reminder, list_reminders, delete_reminder],
+    )
 
 
 def format_time(now: datetime) -> str:
