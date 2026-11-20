@@ -3,7 +3,7 @@ The cloud backend for HomePilot, providing AI agent orchestration, real-time voi
 
 HomePilot Agent 是 [homepilot-client](../homepilot-client) 的云端服务：接收客户端上传的语音，完成识别、对话和语音合成，再把回复语音发回客户端。通信协议见 [homepilot-client/docs/protocol.md](../homepilot-client/docs/protocol.md)。
 
-> 当前进度：第一阶段，语音对话闭环。工具调用（提醒、设备控制等）尚未实现。
+> 当前进度：语音对话闭环 + 基础工具（当前时间、天气、联网搜索）。定时提醒、设备控制尚未实现。
 
 ## 工作方式
 
@@ -19,13 +19,28 @@ HomePilot Agent 是 [homepilot-client](../homepilot-client) 的云端服务：�
 | `app/session.py` | 每个连接一个 `VoiceSession`：处理协议事件，管理当前轮次，编排识别、对话和合成 |
 | `app/asr.py` | `Recognizer`：一轮输入对应一次实时识别 |
 | `app/agent.py` | `Agent`：一个会话对应一个 `ClaudeSDKClient`，多轮追问共享上下文；回复流式按句切分 |
+| `app/tools.py` | Agent 可调用的工具 |
 | `app/tts.py` | `synthesize()`：把一句话合成为 16kHz 单声道 PCM16 |
 | `app/protocol.py` | 二进制音频帧和 JSON 事件的编解码 |
 | `app/config.py` | 配置项 |
 
 一轮对话的过程：收到 `input.end` 后取识别结果，发送 `transcript`；Agent 每生成一句，就先发 `response.text`，再合成语音，以 `response.audio.start`、若干 100ms 音频帧、`response.audio.end` 的形式发出；全部结束后发送 `response.done`。出错时改发 `error`。收到 `turn.cancel` 或新的 `input.start` 时，立即停止当前轮的生成和发送。
 
-DeepSeek 通过它的 Anthropic 兼容接口（`https://api.deepseek.com/anthropic`）接入 Claude Agent SDK。Claude Code 的内置工具（Bash、文件读写等）全部关闭，也不读取本机的 `~/.claude` 设置。
+DeepSeek 通过它的 Anthropic 兼容接口（`https://api.deepseek.com/anthropic`）接入 Claude Agent SDK。Claude Code 的内置工具（Bash、文件读写等）全部关闭，也不读取本机的 `~/.claude` 设置；CLI 在临时目录 `homepilot-agent` 中运行，因为它会把工作目录、git 等环境信息注入给模型，DeepSeek 看到后容易凭空输出 bash 调用。
+
+## 工具
+
+工具在 `app/tools.py` 中用 SDK 的 `@tool` 定义，以进程内 MCP 服务的形式挂到 Agent 上，模型按需调用，无需确认。
+
+| 工具 | 实现 | 说明 |
+| --- | --- | --- |
+| `get_current_time` | 本地计算 | 日期、星期、时间，时区为 `HOMEPILOT_TIMEZONE` |
+| `get_weather` | [Open-Meteo](https://open-meteo.com/)，免费、无需 key | 实时天气和三天预报；没说地点时查 `HOMEPILOT_HOME_CITY`。只支持城市名，不支持区县名 |
+| `web_search` | 通义千问联网搜索（`enable_search`），复用 DashScope key | 返回整理好的事实要点，约 3~5 秒 |
+
+搜索较慢，系统提示词要求模型在搜索前先说一句「我查一下」，这句话会立即合成播放。工具出错时把原因作为结果返回给模型，由模型告诉用户。
+
+新增工具：在 `build_tools()` 中用 `@tool` 定义函数，加入 `create_sdk_mcp_server` 的 `tools` 列表，并把名字加到 `TOOL_NAMES`。
 
 ## 环境
 
@@ -59,7 +74,10 @@ cp .env.example .env   # 填入两个 API key
 | `HOMEPILOT_DEEPSEEK_API_KEY` | 空 | DeepSeek API key |
 | `HOMEPILOT_DEEPSEEK_BASE_URL` | `https://api.deepseek.com/anthropic` | Anthropic 兼容接口地址 |
 | `HOMEPILOT_DEEPSEEK_MODEL` | `deepseek-chat` | 模型名 |
-| `HOMEPILOT_SYSTEM_PROMPT` | 见 `app/config.py` | 助手设定：简短口语，不用 Markdown |
+| `HOMEPILOT_SYSTEM_PROMPT` | 见 `app/config.py` | 助手设定：简短口语，不用 Markdown，按需调用工具 |
+| `HOMEPILOT_TIMEZONE` | `Asia/Shanghai` | 当前时间工具使用的时区 |
+| `HOMEPILOT_HOME_CITY` | `上海` | 没说地点时查询天气的城市 |
+| `HOMEPILOT_SEARCH_MODEL` | `qwen-flash` | 联网搜索用的通义千问模型；`qwen-plus` 更详细但慢一倍 |
 | `HOMEPILOT_LOG_LEVEL` | `INFO` | `DEBUG` 时打印收到的每个事件 |
 
 优先级：系统环境变量 > `.env` > 默认值。

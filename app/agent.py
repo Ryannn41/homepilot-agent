@@ -1,4 +1,5 @@
-"""对话 Agent：Claude Agent SDK 经 DeepSeek 的 Anthropic 兼容接口生成回复，一个语音会话对应一个 Agent。"""
+"""对话 Agent：Claude Agent SDK 经 DeepSeek 的 Anthropic 兼容接口生成回复，可调用 app/tools.py 中的工具。
+一个语音会话对应一个 Agent。"""
 
 import asyncio
 import re
@@ -9,6 +10,7 @@ from pathlib import Path
 from claude_agent_sdk import ClaudeAgentOptions, ClaudeSDKClient, ResultMessage, StreamEvent
 
 from app.config import Settings
+from app.tools import SERVER_NAME, TOOL_NAMES, build_tools
 
 # 句末标点（连续的算一个）；按句切分后可以边生成边合成语音
 _SENTENCE = re.compile(r"[^。！？；!?;\n]*[。！？；!?;\n]+")
@@ -35,7 +37,8 @@ def _options(settings: Settings) -> ClaudeAgentOptions:
         model=model,
         cwd=workdir,
         tools=[],  # 关闭 Claude Code 内置工具（Bash、Read 等）
-        mcp_servers={},  # 家庭工具以后用 create_sdk_mcp_server 挂在这里
+        mcp_servers={SERVER_NAME: build_tools(settings)},
+        allowed_tools=TOOL_NAMES,  # 免确认直接调用
         setting_sources=[],  # 不读取 ~/.claude 等本机设置，避免覆盖下面的接口配置
         include_partial_messages=True,
         env={
