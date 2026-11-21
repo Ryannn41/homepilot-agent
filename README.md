@@ -127,30 +127,7 @@ Ctrl+C 退出。日志中会打印每一轮的识别文本和逐句回复。
 
 每个语音会话会启动一个 Claude Code CLI 子进程，耗时约 1 秒。这一步在收到 `session.start` 后于后台进行，和用户开口说话的时间重叠，一般感觉不到。
 
-## 部署到云服务器
-
-服务需要常驻运行，定时提醒和微信消息才能按时发出。在 Linux 云服务器上：
-
-```bash
-git clone <仓库地址> homepilot-agent && cd homepilot-agent
-./deploy.sh            # 第一次运行会生成 .env 并停下，填好两个 API key 后再运行一次
-```
-
-`deploy.sh` 可以重复运行，依次完成：
-1. 安装缺少的 `tmux`、`curl`。
-2. 没有 conda 时安装 Miniconda 到 `~/miniconda3`。
-3. 创建 `homepilot_agent` 环境并安装依赖。
-4. 首次运行时生成 `.env`，并随机生成客户端令牌。
-5. 运行单元测试。
-6. 在 tmux 会话 `homepilot` 中启动服务。服务异常退出后 5 秒自动重启，日志写入 `logs/agent.log`。
-
-| 操作 | 命令 |
-| --- | --- |
-| 查看实时日志 | `tmux attach -t homepilot`（Ctrl+B 再按 D 退出，服务继续运行） |
-| 更新代码 | `git pull && ./deploy.sh` |
-| 停止服务 | `./deploy.sh stop` |
-
-部署后还要在云服务器的安全组中放行端口（默认 8000），并把客户端的 `HOMEPILOT_SERVER_URL`、`HOMEPILOT_AUTH_TOKEN` 改成服务器地址和 `.env` 中的令牌。公网部署务必设置令牌，否则任何人都能连接并消耗 API 额度。微信需要在服务器上重新扫码登录和绑定（见「绑定微信」）。
+定时提醒和微信到点推送依赖服务端进程常驻；在云服务器上可用 `tmux` 等保持 `python -m app.main` 在后台运行。
 
 ## 与客户端联调
 
