@@ -39,8 +39,23 @@ async def serve_forever(settings: Settings) -> None:
     wechat = WeChat(data_dir / "wechat.json")
     devices: dict[str, VoiceSession] = {}  # 在线设备 -> 它的连接
 
+    async def refresh_schedule(device: str) -> None:
+        if session := devices.get(device):
+            await session.send_schedule_snapshot(reminders, device)
+
     def new_agent(device: str, context: str = "") -> Agent:
-        return Agent(settings, build_tools(settings, device, reminders=reminders, notes=notes, wechat=wechat), context)
+        return Agent(
+            settings,
+            build_tools(
+                settings,
+                device,
+                reminders=reminders,
+                notes=notes,
+                wechat=wechat,
+                on_schedule_changed=lambda: refresh_schedule(device),
+            ),
+            context,
+        )
 
     async def compose_briefing(reminder: Reminder) -> str:
         agent = new_agent(reminder.device_id, BRIEFING_CONTEXT)
@@ -96,6 +111,7 @@ async def serve_forever(settings: Settings) -> None:
         session = VoiceSession(ws, settings, lambda context: new_agent(device, context))
         devices[device] = session
         try:
+            await session.send_schedule_snapshot(reminders, device)
             await session.run()
         finally:
             if devices.get(device) is session:

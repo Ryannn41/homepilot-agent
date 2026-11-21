@@ -1,9 +1,12 @@
 import asyncio
 import json
 import uuid
+from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
 
 from app.config import Settings
 from app.protocol import HEADER, KIND_MIC, KIND_TTS, unpack_audio
+from app.reminders import ReminderStore
 from app.session import TTS_CHUNK, VoiceSession
 
 SESSION = str(uuid.uuid4())
@@ -186,6 +189,19 @@ async def test_new_input_replaces_old_turn_and_drops_stale_frames():
     await wait_for(ws, "response.done")
     await close(ws, task)
     assert {e["turn_id"] for e in ws.events() if e["type"] != "transcript"} == {new}
+
+
+async def test_send_schedule_snapshot(tmp_path):
+    tz = ZoneInfo("Asia/Shanghai")
+    ws, session = new_session()
+    store = ReminderStore(tmp_path / "r.db", tz)
+    now = datetime.now(tz)
+    store.add("dev", "测试提醒", now + timedelta(hours=2), "once")
+    await session.send_schedule_snapshot(store, "dev")
+    ev = ws.events()[0]
+    assert ev["type"] == "schedule.snapshot" and ev["version"] == 1
+    assert len(ev["items"]) == 1 and ev["items"][0]["title"] == "测试提醒"
+    assert "session_id" not in ev and "turn_id" not in ev
 
 
 async def test_notify_outside_session():

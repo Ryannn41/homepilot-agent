@@ -3,6 +3,7 @@
 
 import asyncio
 import logging
+from collections.abc import Awaitable, Callable
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
@@ -38,10 +39,21 @@ DEFAULT_LIST = "备忘"
 
 
 def build_tools(
-    settings: Settings, device_id: str, *, reminders: ReminderStore, notes: NoteStore, wechat: WeChat
+    settings: Settings,
+    device_id: str,
+    *,
+    reminders: ReminderStore,
+    notes: NoteStore,
+    wechat: WeChat,
+    on_schedule_changed: Callable[[], Awaitable[None]] | None = None,
 ) -> McpSdkServerConfig:
     """device_id：提醒、清单属于哪台设备，提醒到点后在这台设备上播放。"""
     tz = ZoneInfo(settings.timezone)
+
+    async def _notify_board(result: str) -> str:
+        if on_schedule_changed is not None:
+            await on_schedule_changed()
+        return result
 
     @tool("get_current_time", "获取当前的日期、星期和时间", {})
     async def get_current_time(args):
@@ -76,7 +88,8 @@ def build_tools(
 
     async def schedule(args, kind: str) -> str:
         at = datetime.strptime(args["time"], "%Y-%m-%d %H:%M").replace(tzinfo=tz)
-        return f"已创建 {reminders.add(device_id, args['content'], at, args['repeat'], kind).describe()}"
+        msg = f"已创建 {reminders.add(device_id, args['content'], at, args['repeat'], kind).describe()}"
+        return await _notify_board(msg)
 
     @tool(
         "create_reminder",
@@ -123,7 +136,10 @@ def build_tools(
     async def delete_reminder(args):
         log.info("调用工具 delete_reminder %s", args)
         deleted = reminders.delete(device_id, int(args["id"]))
-        return _text(f"已删除提醒 #{args['id']}" if deleted else f"没有编号为 {args['id']} 的提醒")
+        msg = f"已删除提醒 #{args['id']}" if deleted else f"没有编号为 {args['id']} 的提醒"
+        if deleted:
+            msg = await _notify_board(msg)
+        return _text(msg)
 
     @tool(
         "start_timer",
@@ -148,7 +164,9 @@ def build_tools(
             duration = format_duration(seconds)
             content = f"{args['label']}，{duration}计时到了" if args.get("label") else f"{duration}计时到了"
             reminder = reminders.add(device_id, content, datetime.now(tz) + timedelta(seconds=seconds), "once")
-            return f"已开始计时 #{reminder.id} {duration}，{reminder.at:%H:%M:%S} 到点"
+            return await _notify_board(
+                f"已开始计时 #{reminder.id} {duration}，{reminder.at:%H:%M:%S} 到点"
+            )
 
         return await _run(start())
 

@@ -21,6 +21,7 @@ HomePilot Agent 是 [homepilot-client](../homepilot-client) 的云端服务：�
 | `app/agent.py` | `Agent`：一个会话对应一个 `ClaudeSDKClient`，多轮追问共享上下文；回复流式按句切分 |
 | `app/tools.py` | Agent 可调用的工具 |
 | `app/reminders.py` | 定时提醒：SQLite 存储和到点检查 |
+| `app/schedule.py` | 将 `reminders.db` 映射为客户端看板用的 `schedule.snapshot` |
 | `app/wechat.py` | 微信通知：扫码登录、记录联系人、发消息 |
 | `app/tts.py` | `synthesize()`：把一句话流式合成为 16kHz 单声道 PCM16 |
 | `app/protocol.py` | 二进制音频帧和 JSON 事件的编解码 |
@@ -64,6 +65,10 @@ DeepSeek 通过它的 Anthropic 兼容接口（`https://api.deepseek.com/anthrop
 - 服务停机期间错过的提醒，超过 30 分钟就不再补发；重复提醒顺延到下一次。
 
 定时简报是一种特殊的提醒：存的不是要播报的文字，而是给 Agent 的指令（如「播报今天的天气、今天的提醒和购物清单」）。到点后服务端为这台设备创建一个 Agent，让它调用工具现场整理一段简报（`app/main.py` 中的 `BRIEFING_CONTEXT` 规定了格式），再像普通提醒一样在音箱播报并发到微信。生成约需 5~10 秒，超过 2 分钟视为失败。简报、提醒和倒计时都可以用「有哪些提醒」「删掉 2 号」查看和取消。
+
+### 桌面看板（schedule.snapshot）
+
+语音 WebSocket 认证通过后，服务端立即向该连接下发一条 `schedule.snapshot`（全量 `items`，无 `session_id` / `turn_id`），数据来自本设备的 `reminders.db` 中未投递条目（映射逻辑见 `app/schedule.py`，与客户端 `docs/protocol.md` 一致）。通过语音创建、删除提醒或启动倒计时后，若设备仍在线，会再推送一次 snapshot 刷新看板。到点播报仍走 `notify.*`，与看板独立。
 
 ### 绑定微信
 

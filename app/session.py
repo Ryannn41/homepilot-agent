@@ -15,6 +15,8 @@ from app.agent import Agent
 from app.asr import Recognizer
 from app.config import SAMPLE_RATE, Settings
 from app.protocol import KIND_MIC, ProtocolError, event, pack_audio, parse_event, unpack_audio
+from app.reminders import ReminderStore
+from app.schedule import build_schedule_snapshot
 
 log = logging.getLogger(__name__)
 
@@ -134,6 +136,13 @@ class VoiceSession:
         except Exception as e:
             log.exception("turn %s 处理失败", turn_id)
             await self._send(turn_id, "error", code="internal_error", message=str(e))
+
+    async def send_schedule_snapshot(self, store: ReminderStore, device_id: str) -> None:
+        """连接建立后下发全量日程，供桌面看板展示（无 session_id / turn_id）。"""
+        payload = build_schedule_snapshot(store, device_id)
+        with suppress(ConnectionClosed):
+            await self._ws.send(event("schedule.snapshot", None, **payload))
+        log.info("已推送 schedule.snapshot，%d 项", len(payload["items"]))
 
     async def notify(self, text: str) -> None:
         """主动推送一条提醒，不属于任何会话。连接已断开时抛出 ConnectionClosed。"""

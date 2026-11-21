@@ -1,4 +1,7 @@
-"""HomePilot 语音 WebSocket 协议 v1（服务端侧），详见 homepilot-client/docs/protocol.md。"""
+"""HomePilot 语音 WebSocket 协议 v1（服务端侧），详见 homepilot-client/docs/protocol.md。
+
+下行 JSON 除对话轮次外，还有不带 session_id / turn_id 的 notify.* 与 schedule.*（如 schedule.snapshot）。
+"""
 
 import json
 import struct
