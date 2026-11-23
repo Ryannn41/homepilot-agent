@@ -257,6 +257,12 @@ class WeChat:
                 if msg.get("message_type") in (None, 1) and msg.get("from_user_id") and msg.get("context_token"):
                     is_new = msg["from_user_id"] != self._state.get("user_id")
                     was_stale = not is_new and self.is_context_stale()
+                    token_at = self._state.get("context_token_at")
+                    replied_nudge = (
+                        not is_new
+                        and token_at
+                        and self._state.get("context_nudge_for") == token_at
+                    )
                     self._note_inbound_context(msg)
                     if is_new:
                         log.info("微信已绑定: %s", msg["from_user_id"])
@@ -264,12 +270,14 @@ class WeChat:
                             await self.send(BIND_REPLY)
                         except Exception:
                             log.exception("微信回复失败")
-                    elif was_stale:
+                    elif was_stale or replied_nudge:
                         log.info("微信 context_token 已刷新")
                         try:
                             await self.send(REFRESH_REPLY)
                         except Exception:
                             log.exception("微信回复失败")
+                    else:
+                        log.info("微信收到消息，已更新 context_token")
 
     async def login(self) -> None:
         resp = await self._http.get(f"{BASE_URL}/ilink/bot/get_bot_qrcode", params={"bot_type": 3})
