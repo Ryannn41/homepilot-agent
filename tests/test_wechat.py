@@ -91,6 +91,56 @@ def test_schedule_wechat_hint_when_stale(tmp_path):
     assert wechat.schedule_wechat_hint().startswith("。注意：")
 
 
+def test_should_nudge_when_near_expiry(tmp_path):
+    path = tmp_path / "wechat.json"
+    almost = (datetime.now(timezone.utc) - timedelta(hours=5, minutes=30)).isoformat()
+    path.write_text(
+        json.dumps({"bot_token": "b", "base_url": "https://x", "user_id": "u", "context_token": "t", "context_token_at": almost})
+    )
+    wechat = WeChat(path, context_max_age=timedelta(hours=6), context_nudge_before=timedelta(hours=1))
+    assert wechat.should_nudge_expiring_context() is True
+
+
+def test_should_not_nudge_when_fresh_or_stale(tmp_path):
+    path = tmp_path / "wechat.json"
+    fresh = datetime.now(timezone.utc).isoformat()
+    path.write_text(
+        json.dumps({"bot_token": "b", "base_url": "https://x", "user_id": "u", "context_token": "t", "context_token_at": fresh})
+    )
+    wechat = WeChat(path, context_max_age=timedelta(hours=6), context_nudge_before=timedelta(hours=1))
+    assert wechat.should_nudge_expiring_context() is False
+
+    old = (datetime.now(timezone.utc) - timedelta(hours=7)).isoformat()
+    path.write_text(
+        json.dumps({"bot_token": "b", "base_url": "https://x", "user_id": "u", "context_token": "t", "context_token_at": old})
+    )
+    wechat = WeChat(path, context_max_age=timedelta(hours=6), context_nudge_before=timedelta(hours=1))
+    assert wechat.should_nudge_expiring_context() is False
+
+
+async def test_nudge_sends_once_per_token_epoch(tmp_path, monkeypatch):
+    path = tmp_path / "wechat.json"
+    almost = (datetime.now(timezone.utc) - timedelta(hours=5, minutes=30)).isoformat()
+    path.write_text(
+        json.dumps({"bot_token": "b", "base_url": "https://x", "user_id": "u", "context_token": "t", "context_token_at": almost})
+    )
+    wechat = WeChat(path, context_max_age=timedelta(hours=6), context_nudge_before=timedelta(hours=1))
+    calls = 0
+
+    async def fake_post(api, payload):
+        nonlocal calls
+        calls += 1
+        return {}
+
+    monkeypatch.setattr(wechat, "_post", fake_post)
+    await wechat.maybe_nudge_expiring_context()
+    await wechat.maybe_nudge_expiring_context()
+    assert calls == 1
+    state = json.loads(path.read_text())
+    assert state["context_nudge_for"] == almost
+    await wechat.close()
+
+
 def test_schedule_wechat_hint_fresh(tmp_path):
     path = tmp_path / "wechat.json"
     fresh = datetime.now(timezone.utc).isoformat()

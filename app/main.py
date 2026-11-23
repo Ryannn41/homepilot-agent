@@ -40,6 +40,7 @@ async def serve_forever(settings: Settings) -> None:
     wechat = WeChat(
         data_dir / "wechat.json",
         context_max_age=timedelta(hours=settings.wechat_context_max_age_hours),
+        context_nudge_before=timedelta(hours=settings.wechat_context_nudge_before_hours),
     )
     devices: dict[str, VoiceSession] = {}  # 在线设备 -> 它的连接
 

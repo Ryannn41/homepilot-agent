@@ -15,6 +15,7 @@ import sys
 import time
 import uuid
 from datetime import datetime, timedelta, timezone
+from contextlib import suppress
 from pathlib import Path
 from typing import Any
 
@@ -28,7 +29,12 @@ log = logging.getLogger(__name__)
 BASE_URL = "https://ilinkai.weixin.qq.com"
 BIND_REPLY = "已绑定 HomePilot。定时提醒会同时发到这里。"
 REFRESH_REPLY = "微信提醒已恢复，定时消息会正常发到这儿。"
+EXPIRY_NUDGE_REPLY = (
+    "HomePilot：你有一段时间没在跟 Bot 说话了，微信上的定时提醒可能会收不到。"
+    "请随便回复我一条消息，刷新会话。"
+)
 LOGIN_CHECK_S = 10
+NUDGE_CHECK_S = 60
 STALE_USER_HINT = "很久没在微信跟 HomePilot 说过话了，请给 Bot 发任意一条消息，微信提醒才能正常收到。"
 MAX_DELIVERY_FAILURES = 10
 
@@ -57,10 +63,17 @@ def _is_stale_token_error(exc: BaseException) -> bool:
 
 
 class WeChat:
-    def __init__(self, state_path: str | Path, *, context_max_age: timedelta | None = None):
+    def __init__(
+        self,
+        state_path: str | Path,
+        *,
+        context_max_age: timedelta | None = None,
+        context_nudge_before: timedelta | None = None,
+    ):
         self._path = Path(state_path)
         self._state: dict[str, Any] = {}
         self._context_max_age = context_max_age or timedelta(hours=6)
+        self._context_nudge_before = context_nudge_before or timedelta(hours=1)
         self._load()
         self._http = httpx.AsyncClient(timeout=httpx.Timeout(45, connect=10))
 
@@ -72,16 +85,34 @@ class WeChat:
     def logged_in(self) -> bool:
         return bool(self._state.get("bot_token"))
 
+    def _context_token_updated_at(self) -> datetime | None:
+        at = self._state.get("context_token_at")
+        if not at or not isinstance(at, str):
+            return None
+        return _parse_iso(at)
+
     def is_context_stale(self) -> bool:
         if not self._state.get("context_token"):
             return False
-        at = self._state.get("context_token_at")
-        if not at or not isinstance(at, str):
-            return True
-        updated = _parse_iso(at)
+        updated = self._context_token_updated_at()
         if updated is None:
             return True
         return _utc_now() - updated > self._context_max_age
+
+    def should_nudge_expiring_context(self) -> bool:
+        """token 仍可发微信、但距离本地判定的失效时间不远时，需要主动提醒用户发一条刷新。"""
+        if not self.logged_in or not self._state.get("context_token") or self.is_context_stale():
+            return False
+        updated = self._context_token_updated_at()
+        if updated is None:
+            return False
+        age = _utc_now() - updated
+        nudge_at = self._context_max_age - self._context_nudge_before
+        if age < nudge_at:
+            return False
+        nudged_for = self._state.get("context_nudge_for")
+        token_at = self._state.get("context_token_at")
+        return nudged_for != token_at
 
     def record_delivery_failure(self, *, reminder_id: int | None, content: str, error: str) -> None:
         failures = list(self._state.get("delivery_failures") or [])
@@ -162,6 +193,18 @@ class WeChat:
                 self.record_delivery_failure(error=str(e), **failure_meta)
             raise
 
+    async def maybe_nudge_expiring_context(self) -> None:
+        if not self.should_nudge_expiring_context():
+            return
+        token_at = self._state.get("context_token_at")
+        try:
+            await self.send(EXPIRY_NUDGE_REPLY)
+        except WeChatError:
+            log.warning("微信 session 即将过期提醒发送失败", exc_info=True)
+            return
+        self._save(context_nudge_for=token_at)
+        log.info("已发送微信 session 即将过期提醒")
+
     def _note_inbound_context(self, msg: dict[str, Any]) -> None:
         """用户发来微信消息时刷新 context_token，并清除已记录的投递失败。"""
         self._save(
@@ -169,6 +212,7 @@ class WeChat:
             context_token=msg["context_token"],
             context_token_at=_utc_now().isoformat(),
             delivery_failures=[],
+            context_nudge_for=None,
         )
 
     async def run(self) -> None:
@@ -181,6 +225,21 @@ class WeChat:
         log.info("微信已登录，%s", "提醒会同时发到微信" if self._state.get("context_token") else "请用微信给 Bot 发一条消息完成绑定")
         if self.is_context_stale():
             log.warning("微信 context_token 可能已过期，主动推送会失败，直到用户给 Bot 发消息：%s", STALE_USER_HINT)
+        nudge_task = asyncio.create_task(self._run_expiry_nudge_loop())
+        try:
+            await self._run_updates_loop()
+        finally:
+            nudge_task.cancel()
+            with suppress(Exception):
+                await nudge_task
+
+    async def _run_expiry_nudge_loop(self) -> None:
+        while True:
+            self._load()
+            await self.maybe_nudge_expiring_context()
+            await asyncio.sleep(NUDGE_CHECK_S)
+
+    async def _run_updates_loop(self) -> None:
         while True:
             try:
                 result = await self._post("/ilink/bot/getupdates", {"get_updates_buf": self._state.get("cursor", "")})

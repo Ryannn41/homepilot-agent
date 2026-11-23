@@ -81,7 +81,7 @@ python -m app.main           # 启动服务
 
 服务运行时，用你的微信给这个 Bot 发任意一条消息，收到「已绑定 HomePilot」即完成绑定；之后提醒会同时发到这个微信。登录信息保存在 `data/wechat.json`（已加入 `.gitignore`）。未登录时服务照常运行，提醒只在音箱播报；服务每 10 秒检查一次登录状态，扫码登录后不用重启。
 
-iLink 要求主动推送携带用户最近一次发来的 `context_token`。若超过 `HOMEPILOT_WECHAT_CONTEXT_MAX_AGE_HOURS`（默认 6 小时）没有给 Bot 发过消息，服务端会跳过发送并记录失败；客户端连接时会收到 `wechat.status`，Agent 也会被告知引导用户「给 Bot 发一条消息刷新」。用户再次发消息后失败记录会清除；若此前 token 已过期，Bot 会回复「微信提醒已恢复…」（首次绑定仍回复「已绑定 HomePilot」）。
+iLink 要求主动推送携带用户最近一次发来的 `context_token`。若超过 `HOMEPILOT_WECHAT_CONTEXT_MAX_AGE_HOURS`（默认 6 小时）没有给 Bot 发过消息，服务端会跳过发送并记录失败；客户端连接时会收到 `wechat.status`，Agent 也会被告知引导用户「给 Bot 发一条消息刷新」。在 token **仍可用**、且距离上述失效阈值不足 `HOMEPILOT_WECHAT_CONTEXT_NUDGE_BEFORE_HOURS`（默认 1 小时）时，服务端会 **主动发一条微信** 请你给 Bot 发消息刷新，同一轮 token 只提醒一次。用户再次发消息后失败记录会清除；若此前 token 已过期，Bot 会回复「微信提醒已恢复…」（首次绑定仍回复「已绑定 HomePilot」）。
 
 ## 环境
 
