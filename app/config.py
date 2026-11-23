@@ -46,4 +46,5 @@ class Settings(BaseSettings):
     search_model: str = "qwen-flash"  # 联网搜索用的通义千问模型（复用 DashScope key）
 
     data_dir: str = "data"  # 提醒数据库、微信登录状态
+    wechat_context_max_age_hours: float = 6.0  # 超过这么久未收到用户微信消息，视为 context_token 可能失效
     log_level: Literal["DEBUG", "INFO", "WARNING", "ERROR"] = "INFO"

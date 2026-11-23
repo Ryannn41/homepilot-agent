@@ -14,6 +14,7 @@ import random
 import sys
 import time
 import uuid
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -27,16 +28,38 @@ log = logging.getLogger(__name__)
 BASE_URL = "https://ilinkai.weixin.qq.com"
 BIND_REPLY = "已绑定 HomePilot。定时提醒会同时发到这里。"
 LOGIN_CHECK_S = 10
+STALE_USER_HINT = "很久没在微信跟 HomePilot 说过话了，请给 Bot 发任意一条消息，微信提醒才能正常收到。"
+MAX_DELIVERY_FAILURES = 10
 
 
 class WeChatError(RuntimeError):
     pass
 
 
+def _utc_now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def _parse_iso(value: str) -> datetime | None:
+    try:
+        dt = datetime.fromisoformat(value)
+    except ValueError:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt
+
+
+def _is_stale_token_error(exc: BaseException) -> bool:
+    msg = str(exc).lower()
+    return "prepare failed" in msg or "会话可能已过期" in msg
+
+
 class WeChat:
-    def __init__(self, state_path: str | Path):
+    def __init__(self, state_path: str | Path, *, context_max_age: timedelta | None = None):
         self._path = Path(state_path)
-        self._state: dict[str, str] = {}
+        self._state: dict[str, Any] = {}
+        self._context_max_age = context_max_age or timedelta(hours=6)
         self._load()
         self._http = httpx.AsyncClient(timeout=httpx.Timeout(45, connect=10))
 
@@ -48,25 +71,103 @@ class WeChat:
     def logged_in(self) -> bool:
         return bool(self._state.get("bot_token"))
 
+    def is_context_stale(self) -> bool:
+        if not self._state.get("context_token"):
+            return False
+        at = self._state.get("context_token_at")
+        if not at or not isinstance(at, str):
+            return True
+        updated = _parse_iso(at)
+        if updated is None:
+            return True
+        return _utc_now() - updated > self._context_max_age
+
+    def record_delivery_failure(self, *, reminder_id: int | None, content: str, error: str) -> None:
+        failures = list(self._state.get("delivery_failures") or [])
+        failures.append(
+            {
+                "at": _utc_now().isoformat(),
+                "reminder_id": reminder_id,
+                "content": content,
+                "error": error,
+            }
+        )
+        self._save(delivery_failures=failures[-MAX_DELIVERY_FAILURES:])
+        log.warning("微信提醒投递失败已记录（共 %d 条待用户处理）", len(self._state.get("delivery_failures") or []))
+
+    def status_payload(self) -> dict[str, Any] | None:
+        failures = self._state.get("delivery_failures") or []
+        stale = self.is_context_stale()
+        if not failures and not stale:
+            return None
+        return {
+            "context_stale": stale,
+            "context_token_at": self._state.get("context_token_at"),
+            "delivery_failures": failures,
+            "hint": STALE_USER_HINT,
+        }
+
+    def schedule_wechat_hint(self) -> str:
+        """创建定时提醒/简报/倒计时时，若微信可能发不出去，拼进工具返回给 Agent。"""
+        if not self.logged_in or not self._state.get("context_token"):
+            return ""
+        if self.is_context_stale():
+            return f"。注意：{STALE_USER_HINT}"
+        return ""
+
+    def session_context(self) -> str:
+        payload = self.status_payload()
+        if not payload:
+            return ""
+        parts: list[str] = []
+        if payload["context_stale"]:
+            parts.append(f"\n当前微信主动推送可能不可用：{STALE_USER_HINT}")
+        if payload["delivery_failures"]:
+            missed = "、".join(str(f["content"]) for f in payload["delivery_failures"])
+            parts.append(f"\n以下定时提醒没能发到微信：{missed}。若用户问起，说明原因并提醒：{STALE_USER_HINT}")
+        return "".join(parts)
+
     async def close(self) -> None:
         await self._http.aclose()
 
-    async def send(self, text: str) -> None:
+    async def send(self, text: str, *, failure_meta: dict[str, Any] | None = None) -> None:
         if not self._state.get("context_token"):
-            raise WeChatError("还没有绑定微信：请先用微信给 Bot 发一条消息")
-        await self._post(
-            "/ilink/bot/sendmessage",
-            {
-                "msg": {
-                    "from_user_id": "",
-                    "to_user_id": self._state["user_id"],
-                    "client_id": f"homepilot:{int(time.time() * 1000)}:{uuid.uuid4().hex[:8]}",
-                    "message_type": 2,
-                    "message_state": 2,
-                    "context_token": self._state["context_token"],
-                    "item_list": [{"type": 1, "text_item": {"text": text}}],
-                }
-            },
+            err = WeChatError("还没有绑定微信：请先用微信给 Bot 发一条消息")
+            if failure_meta:
+                self.record_delivery_failure(error=str(err), **failure_meta)
+            raise err
+        if self.is_context_stale():
+            err = WeChatError(f"微信会话可能已过期（{STALE_USER_HINT}）")
+            if failure_meta:
+                self.record_delivery_failure(error=str(err), **failure_meta)
+            raise err
+        try:
+            await self._post(
+                "/ilink/bot/sendmessage",
+                {
+                    "msg": {
+                        "from_user_id": "",
+                        "to_user_id": self._state["user_id"],
+                        "client_id": f"homepilot:{int(time.time() * 1000)}:{uuid.uuid4().hex[:8]}",
+                        "message_type": 2,
+                        "message_state": 2,
+                        "context_token": self._state["context_token"],
+                        "item_list": [{"type": 1, "text_item": {"text": text}}],
+                    }
+                },
+            )
+        except WeChatError as e:
+            if failure_meta and _is_stale_token_error(e):
+                self.record_delivery_failure(error=str(e), **failure_meta)
+            raise
+
+    def _note_inbound_context(self, msg: dict[str, Any]) -> None:
+        """用户发来微信消息时刷新 context_token，并清除已记录的投递失败。"""
+        self._save(
+            user_id=msg["from_user_id"],
+            context_token=msg["context_token"],
+            context_token_at=_utc_now().isoformat(),
+            delivery_failures=[],
         )
 
     async def run(self) -> None:
@@ -77,6 +178,8 @@ class WeChat:
             await asyncio.sleep(LOGIN_CHECK_S)
             self._load()
         log.info("微信已登录，%s", "提醒会同时发到微信" if self._state.get("context_token") else "请用微信给 Bot 发一条消息完成绑定")
+        if self.is_context_stale():
+            log.warning("微信 context_token 可能已过期，主动推送会失败，直到用户给 Bot 发消息：%s", STALE_USER_HINT)
         while True:
             try:
                 result = await self._post("/ilink/bot/getupdates", {"get_updates_buf": self._state.get("cursor", "")})
@@ -93,7 +196,7 @@ class WeChat:
             for msg in result.get("msgs") or []:
                 if msg.get("message_type") in (None, 1) and msg.get("from_user_id") and msg.get("context_token"):
                     is_new = msg["from_user_id"] != self._state.get("user_id")
-                    self._save(user_id=msg["from_user_id"], context_token=msg["context_token"])
+                    self._note_inbound_context(msg)
                     if not is_new:
                         continue
                     log.info("微信已绑定: %s", msg["from_user_id"])
@@ -158,7 +261,7 @@ class WeChat:
             raise WeChatError(f"iLink 接口错误: {result.get('errmsg') or result}")
         return result
 
-    def _save(self, **changes: str) -> None:
+    def _save(self, **changes: Any) -> None:
         self._state.update(changes)
         self._path.parent.mkdir(parents=True, exist_ok=True)
         tmp = self._path.with_suffix(".tmp")

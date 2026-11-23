@@ -3,6 +3,7 @@
 import asyncio
 import hmac
 import logging
+from datetime import timedelta
 from http import HTTPStatus
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -36,7 +37,10 @@ async def serve_forever(settings: Settings) -> None:
     data_dir = Path(settings.data_dir)
     reminders = ReminderStore(data_dir / "reminders.db", tz)
     notes = NoteStore(data_dir / "notes.db")
-    wechat = WeChat(data_dir / "wechat.json")
+    wechat = WeChat(
+        data_dir / "wechat.json",
+        context_max_age=timedelta(hours=settings.wechat_context_max_age_hours),
+    )
     devices: dict[str, VoiceSession] = {}  # 在线设备 -> 它的连接
 
     async def refresh_schedule(device: str) -> None:
@@ -87,12 +91,18 @@ async def serve_forever(settings: Settings) -> None:
             except Exception:
                 log.exception("提醒 #%d 推送到音箱失败", reminder.id)
 
+        failure_meta = {"reminder_id": reminder.id, "content": reminder.content}
+
         async def to_wechat() -> None:
             try:
-                await wechat.send(wechat_text)
+                await wechat.send(wechat_text, failure_meta=failure_meta)
                 log.info("提醒 #%d 已发到微信", reminder.id)
             except Exception as e:
                 log.warning("提醒 #%d 微信发送失败: %s", reminder.id, e)
+                if session := devices.get(reminder.device_id):
+                    if status := wechat.status_payload():
+                        await session.send_wechat_status(status)
+                    session.set_session_context(wechat.session_context())
 
         await asyncio.gather(to_speaker(), to_wechat())
 
@@ -110,7 +120,10 @@ async def serve_forever(settings: Settings) -> None:
         log.info("客户端已连接: device=%s %s", device, ws.remote_address)
         session = VoiceSession(ws, settings, lambda context: new_agent(device, context))
         devices[device] = session
+        session.set_session_context(wechat.session_context())
         try:
+            if status := wechat.status_payload():
+                await session.send_wechat_status(status)
             await session.send_schedule_snapshot(reminders, device)
             await session.run()
         finally:

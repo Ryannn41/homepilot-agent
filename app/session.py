@@ -42,6 +42,7 @@ class VoiceSession:
         self._synthesize = synthesize
         self._last_notice: tuple[float, str] | None = None  # (monotonic 时间, 提醒文字)
         self._unheard_notices: list[str] = []  # 会话进行中播报、Agent 还不知道的提醒
+        self._session_context = ""  # 微信投递状态等，拼进 Agent 背景
 
         self._session_id: str | None = None
         self._agent: Agent | None = None
@@ -137,6 +138,14 @@ class VoiceSession:
             log.exception("turn %s 处理失败", turn_id)
             await self._send(turn_id, "error", code="internal_error", message=str(e))
 
+    def set_session_context(self, context: str) -> None:
+        self._session_context = context
+
+    async def send_wechat_status(self, payload: dict) -> None:
+        """微信 context 过期或存在未送达的定时提醒时，通知客户端（可选展示）。"""
+        with suppress(ConnectionClosed):
+            await self._ws.send(event("wechat.status", None, version=1, **payload))
+
     async def send_schedule_snapshot(self, store: ReminderStore, device_id: str) -> None:
         """连接建立后下发全量日程，供桌面看板展示（无 session_id / turn_id）。"""
         payload = build_schedule_snapshot(store, device_id)
@@ -195,9 +204,14 @@ class VoiceSession:
 
     def _notice_context(self) -> str:
         """提醒播完后客户端会开新会话等用户回应，让 Agent 知道刚才播报了什么。"""
-        if self._last_notice is None or time.monotonic() - self._last_notice[0] > NOTICE_CONTEXT_S:
-            return ""
-        return f"\n刚才你主动播报了一条定时提醒：「{self._last_notice[1]}」，用户接下来的话可能是在回应它。"
+        parts: list[str] = []
+        if self._session_context:
+            parts.append(self._session_context)
+        if self._last_notice is not None and time.monotonic() - self._last_notice[0] <= NOTICE_CONTEXT_S:
+            parts.append(
+                f"\n刚才你主动播报了一条定时提醒：「{self._last_notice[1]}」，用户接下来的话可能是在回应它。"
+            )
+        return "".join(parts)
 
     async def _end_session(self) -> None:
         await self._cancel_turn()

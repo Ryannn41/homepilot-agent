@@ -191,6 +191,24 @@ async def test_new_input_replaces_old_turn_and_drops_stale_frames():
     assert {e["turn_id"] for e in ws.events() if e["type"] != "transcript"} == {new}
 
 
+async def test_send_wechat_status():
+    ws, session = new_session()
+    await session.send_wechat_status({"context_stale": True, "hint": "发一条"})
+    ev = ws.events()[0]
+    assert ev["type"] == "wechat.status" and ev["version"] == 1
+    assert ev["context_stale"] is True
+    assert "session_id" not in ev and "turn_id" not in ev
+
+
+async def test_session_context_passed_to_agent():
+    ws, session = new_session()
+    session.set_session_context("\n微信提醒可能不可用。")
+    task = asyncio.create_task(session.run())
+    await ws.incoming.put(ev("session.start"))
+    await close(ws, task)
+    assert "微信提醒可能不可用" in FakeAgent.instances[-1].context
+
+
 async def test_send_schedule_snapshot(tmp_path):
     tz = ZoneInfo("Asia/Shanghai")
     ws, session = new_session()

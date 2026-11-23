@@ -88,7 +88,7 @@ def build_tools(
 
     async def schedule(args, kind: str) -> str:
         at = datetime.strptime(args["time"], "%Y-%m-%d %H:%M").replace(tzinfo=tz)
-        msg = f"已创建 {reminders.add(device_id, args['content'], at, args['repeat'], kind).describe()}"
+        msg = f"已创建 {reminders.add(device_id, args['content'], at, args['repeat'], kind).describe()}{wechat.schedule_wechat_hint()}"
         return await _notify_board(msg)
 
     @tool(
@@ -165,7 +165,7 @@ def build_tools(
             content = f"{args['label']}，{duration}计时到了" if args.get("label") else f"{duration}计时到了"
             reminder = reminders.add(device_id, content, datetime.now(tz) + timedelta(seconds=seconds), "once")
             return await _notify_board(
-                f"已开始计时 #{reminder.id} {duration}，{reminder.at:%H:%M:%S} 到点"
+                f"已开始计时 #{reminder.id} {duration}，{reminder.at:%H:%M:%S} 到点{wechat.schedule_wechat_hint()}"
             )
 
         return await _run(start())
