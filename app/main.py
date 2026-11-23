@@ -46,7 +46,7 @@ async def serve_forever(settings: Settings) -> None:
 
     async def refresh_schedule(device: str) -> None:
         if session := devices.get(device):
-            await session.send_schedule_snapshot(reminders, device)
+            await session.send_schedule_snapshot(reminders, device, notes=notes)
 
     def new_agent(device: str, context: str = "") -> Agent:
         return Agent(
@@ -125,7 +125,7 @@ async def serve_forever(settings: Settings) -> None:
         try:
             if status := wechat.status_payload():
                 await session.send_wechat_status(status)
-            await session.send_schedule_snapshot(reminders, device)
+            await session.send_schedule_snapshot(reminders, device, notes=notes)
             await session.run()
         finally:
             if devices.get(device) is session:

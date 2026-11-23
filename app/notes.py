@@ -20,6 +20,16 @@ class NoteStore:
                 [(device_id, list_name, item.strip()) for item in items if item.strip()],
             )
 
+    def entries(self, device_id: str) -> list[tuple[int, str, str]]:
+        """按 id 顺序返回 (id, list_name, item)。"""
+        return [
+            (row[0], row[1], row[2])
+            for row in self._db.execute(
+                "SELECT id, list, item FROM notes WHERE device_id = ? ORDER BY id",
+                (device_id,),
+            )
+        ]
+
     def lists(self, device_id: str, list_name: str | None = None) -> dict[str, list[str]]:
         """清单名 -> 条目（按添加顺序）；list_name 为空时返回所有清单。"""
         sql, params = "SELECT list, item FROM notes WHERE device_id = ?", [device_id]

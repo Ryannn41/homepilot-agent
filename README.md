@@ -68,7 +68,7 @@ DeepSeek 通过它的 Anthropic 兼容接口（`https://api.deepseek.com/anthrop
 
 ### 桌面看板（schedule.snapshot）
 
-语音 WebSocket 认证通过后，服务端立即向该连接下发一条 `schedule.snapshot`（全量 `items`，无 `session_id` / `turn_id`），数据来自本设备的 `reminders.db` 中未投递条目（映射逻辑见 `app/schedule.py`，与客户端 `docs/protocol.md` 一致）。通过语音创建、删除提醒或启动倒计时后，若设备仍在线，会再推送一次 snapshot 刷新看板。到点播报仍走 `notify.*`，与看板独立。
+语音 WebSocket 认证通过后，服务端立即向该连接下发一条 `schedule.snapshot`（全量 `items`，无 `session_id` / `turn_id`）：**定时提醒 / 倒计时**来自 `reminders.db`，映射为 `kind=reminder|countdown` 且固定进看板「即将到期」；**备忘清单**（`notes.db`，含「待办」「购物清单」等）映射为 `kind=task` 且进「待办」列（见 `app/schedule.py`，与客户端 `docs/protocol.md` 一致）。创建/删除提醒、改备忘或启动倒计时后，若设备仍在线会再推送 snapshot。到点播报仍走 `notify.*`，与看板独立。
 
 ### 绑定微信
 

@@ -224,7 +224,8 @@ def build_tools(
         log.info("调用工具 add_note %s", args)
         list_name = args.get("list") or DEFAULT_LIST
         notes.add(device_id, list_name, args["items"])
-        return _text(f"已记到「{list_name}」，现在有：{'、'.join(notes.lists(device_id, list_name).get(list_name, []))}")
+        items = notes.lists(device_id, list_name).get(list_name, [])
+        return await _notify_board(f"已记到「{list_name}」，现在有：{'、'.join(items)}")
 
     @tool(
         "list_notes",
@@ -249,7 +250,8 @@ def build_tools(
         log.info("调用工具 remove_note %s", args)
         list_name = args.get("list") or DEFAULT_LIST
         removed = notes.remove(device_id, list_name, args["keyword"])
-        return _text(f"已从「{list_name}」划掉：{'、'.join(removed)}" if removed else f"「{list_name}」里没有「{args['keyword']}」")
+        msg = f"已从「{list_name}」划掉：{'、'.join(removed)}" if removed else f"「{list_name}」里没有「{args['keyword']}」"
+        return await _notify_board(msg)
 
     @tool(
         "clear_notes",
@@ -259,7 +261,7 @@ def build_tools(
     async def clear_notes(args):
         log.info("调用工具 clear_notes %s", args)
         list_name = args.get("list") or DEFAULT_LIST
-        return _text(f"已清空「{list_name}」，共 {notes.clear(device_id, list_name)} 条")
+        return await _notify_board(f"已清空「{list_name}」，共 {notes.clear(device_id, list_name)} 条")
 
     @tool(
         "send_to_wechat",
