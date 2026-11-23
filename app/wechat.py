@@ -27,6 +27,7 @@ log = logging.getLogger(__name__)
 
 BASE_URL = "https://ilinkai.weixin.qq.com"
 BIND_REPLY = "已绑定 HomePilot。定时提醒会同时发到这里。"
+REFRESH_REPLY = "微信提醒已恢复，定时消息会正常发到这儿。"
 LOGIN_CHECK_S = 10
 STALE_USER_HINT = "很久没在微信跟 HomePilot 说过话了，请给 Bot 发任意一条消息，微信提醒才能正常收到。"
 MAX_DELIVERY_FAILURES = 10
@@ -196,14 +197,20 @@ class WeChat:
             for msg in result.get("msgs") or []:
                 if msg.get("message_type") in (None, 1) and msg.get("from_user_id") and msg.get("context_token"):
                     is_new = msg["from_user_id"] != self._state.get("user_id")
+                    was_stale = not is_new and self.is_context_stale()
                     self._note_inbound_context(msg)
-                    if not is_new:
-                        continue
-                    log.info("微信已绑定: %s", msg["from_user_id"])
-                    try:
-                        await self.send(BIND_REPLY)
-                    except Exception:
-                        log.exception("微信回复失败")
+                    if is_new:
+                        log.info("微信已绑定: %s", msg["from_user_id"])
+                        try:
+                            await self.send(BIND_REPLY)
+                        except Exception:
+                            log.exception("微信回复失败")
+                    elif was_stale:
+                        log.info("微信 context_token 已刷新")
+                        try:
+                            await self.send(REFRESH_REPLY)
+                        except Exception:
+                            log.exception("微信回复失败")
 
     async def login(self) -> None:
         resp = await self._http.get(f"{BASE_URL}/ilink/bot/get_bot_qrcode", params={"bot_type": 3})

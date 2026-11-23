@@ -5,7 +5,7 @@ from datetime import datetime, timedelta, timezone
 import pytest
 
 from app import wechat as wechat_module
-from app.wechat import BIND_REPLY, WeChat, WeChatError
+from app.wechat import BIND_REPLY, REFRESH_REPLY, WeChat, WeChatError
 
 
 async def test_run_waits_for_login_then_binds_sender(tmp_path, monkeypatch):
@@ -99,6 +99,59 @@ def test_schedule_wechat_hint_fresh(tmp_path):
     )
     wechat = WeChat(path)
     assert wechat.schedule_wechat_hint() == ""
+
+
+async def test_stale_inbound_sends_refresh_reply(tmp_path, monkeypatch):
+    monkeypatch.setattr(wechat_module, "LOGIN_CHECK_S", 0.01)
+    old = (datetime.now(timezone.utc) - timedelta(hours=7)).isoformat()
+    path = tmp_path / "wechat.json"
+    path.write_text(
+        json.dumps(
+            {"bot_token": "b", "base_url": "https://x", "user_id": "u1", "context_token": "t0", "context_token_at": old}
+        )
+    )
+    wechat = WeChat(path, context_max_age=timedelta(hours=6))
+    posted = []
+
+    async def fake_post(api, payload):
+        posted.append((api, payload))
+        if api.endswith("getupdates"):
+            return {"get_updates_buf": "c", "msgs": [{"message_type": 1, "from_user_id": "u1", "context_token": "t1"}]}
+        return {}
+
+    monkeypatch.setattr(wechat, "_post", fake_post)
+    task = asyncio.create_task(wechat.run())
+    await asyncio.sleep(0.05)
+    task.cancel()
+    await wechat.close()
+    sent = [p for api, p in posted if api.endswith("sendmessage")]
+    assert sent[0]["msg"]["item_list"][0]["text_item"]["text"] == REFRESH_REPLY
+
+
+async def test_fresh_inbound_does_not_auto_reply(tmp_path, monkeypatch):
+    monkeypatch.setattr(wechat_module, "LOGIN_CHECK_S", 0.01)
+    fresh = datetime.now(timezone.utc).isoformat()
+    path = tmp_path / "wechat.json"
+    path.write_text(
+        json.dumps(
+            {"bot_token": "b", "base_url": "https://x", "user_id": "u1", "context_token": "t0", "context_token_at": fresh}
+        )
+    )
+    wechat = WeChat(path)
+    posted = []
+
+    async def fake_post(api, payload):
+        posted.append(api)
+        if api.endswith("getupdates"):
+            return {"get_updates_buf": "c", "msgs": [{"message_type": 1, "from_user_id": "u1", "context_token": "t1"}]}
+        return {}
+
+    monkeypatch.setattr(wechat, "_post", fake_post)
+    task = asyncio.create_task(wechat.run())
+    await asyncio.sleep(0.05)
+    task.cancel()
+    await wechat.close()
+    assert not any(api.endswith("sendmessage") for api in posted)
 
 
 async def test_inbound_clears_delivery_failures(tmp_path, monkeypatch):
