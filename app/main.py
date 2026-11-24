@@ -3,7 +3,6 @@
 import asyncio
 import hmac
 import logging
-from datetime import timedelta
 from http import HTTPStatus
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -37,11 +36,7 @@ async def serve_forever(settings: Settings) -> None:
     data_dir = Path(settings.data_dir)
     reminders = ReminderStore(data_dir / "reminders.db", tz)
     notes = NoteStore(data_dir / "notes.db")
-    wechat = WeChat(
-        data_dir / "wechat.json",
-        context_max_age=timedelta(hours=settings.wechat_context_max_age_hours),
-        context_nudge_before=timedelta(hours=settings.wechat_context_nudge_before_hours),
-    )
+    wechat = WeChat(data_dir / "wechat.json")
     devices: dict[str, VoiceSession] = {}  # 在线设备 -> 它的连接
 
     async def refresh_schedule(device: str) -> None:

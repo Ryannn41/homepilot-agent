@@ -14,8 +14,7 @@ import random
 import sys
 import time
 import uuid
-from datetime import datetime, timedelta, timezone
-from contextlib import suppress
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -29,12 +28,7 @@ log = logging.getLogger(__name__)
 BASE_URL = "https://ilinkai.weixin.qq.com"
 BIND_REPLY = "已绑定 HomePilot。定时提醒会同时发到这里。"
 REFRESH_REPLY = "微信提醒已恢复，定时消息会正常发到这儿。"
-EXPIRY_NUDGE_REPLY = (
-    "HomePilot：你有一段时间没在跟 Bot 说话了，微信上的定时提醒可能会收不到。"
-    "请随便回复我一条消息，刷新会话。"
-)
 LOGIN_CHECK_S = 10
-NUDGE_CHECK_S = 60
 STALE_USER_HINT = "很久没在微信跟 HomePilot 说过话了，请给 Bot 发任意一条消息，微信提醒才能正常收到。"
 MAX_DELIVERY_FAILURES = 10
 
@@ -47,33 +41,15 @@ def _utc_now() -> datetime:
     return datetime.now(timezone.utc)
 
 
-def _parse_iso(value: str) -> datetime | None:
-    try:
-        dt = datetime.fromisoformat(value)
-    except ValueError:
-        return None
-    if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=timezone.utc)
-    return dt
-
-
 def _is_stale_token_error(exc: BaseException) -> bool:
     msg = str(exc).lower()
     return "prepare failed" in msg or "会话可能已过期" in msg
 
 
 class WeChat:
-    def __init__(
-        self,
-        state_path: str | Path,
-        *,
-        context_max_age: timedelta | None = None,
-        context_nudge_before: timedelta | None = None,
-    ):
+    def __init__(self, state_path: str | Path):
         self._path = Path(state_path)
         self._state: dict[str, Any] = {}
-        self._context_max_age = context_max_age or timedelta(hours=6)
-        self._context_nudge_before = context_nudge_before or timedelta(hours=1)
         self._load()
         self._http = httpx.AsyncClient(timeout=httpx.Timeout(45, connect=10))
 
@@ -84,35 +60,6 @@ class WeChat:
     @property
     def logged_in(self) -> bool:
         return bool(self._state.get("bot_token"))
-
-    def _context_token_updated_at(self) -> datetime | None:
-        at = self._state.get("context_token_at")
-        if not at or not isinstance(at, str):
-            return None
-        return _parse_iso(at)
-
-    def is_context_stale(self) -> bool:
-        if not self._state.get("context_token"):
-            return False
-        updated = self._context_token_updated_at()
-        if updated is None:
-            return True
-        return _utc_now() - updated > self._context_max_age
-
-    def should_nudge_expiring_context(self) -> bool:
-        """token 仍可发微信、但距离本地判定的失效时间不远时，需要主动提醒用户发一条刷新。"""
-        if not self.logged_in or not self._state.get("context_token") or self.is_context_stale():
-            return False
-        updated = self._context_token_updated_at()
-        if updated is None:
-            return False
-        age = _utc_now() - updated
-        nudge_at = self._context_max_age - self._context_nudge_before
-        if age < nudge_at:
-            return False
-        nudged_for = self._state.get("context_nudge_for")
-        token_at = self._state.get("context_token_at")
-        return nudged_for != token_at
 
     def record_delivery_failure(self, *, reminder_id: int | None, content: str, error: str) -> None:
         failures = list(self._state.get("delivery_failures") or [])
@@ -129,35 +76,27 @@ class WeChat:
 
     def status_payload(self) -> dict[str, Any] | None:
         failures = self._state.get("delivery_failures") or []
-        stale = self.is_context_stale()
-        if not failures and not stale:
+        if not failures:
             return None
         return {
-            "context_stale": stale,
+            "context_stale": False,
             "context_token_at": self._state.get("context_token_at"),
             "delivery_failures": failures,
             "hint": STALE_USER_HINT,
         }
 
     def schedule_wechat_hint(self) -> str:
-        """创建定时提醒/简报/倒计时时，若微信可能发不出去，拼进工具返回给 Agent。"""
+        """创建定时提醒/简报/倒计时时，若尚未绑定微信，拼进工具返回给 Agent。"""
         if not self.logged_in or not self._state.get("context_token"):
-            return ""
-        if self.is_context_stale():
-            return f"。注意：{STALE_USER_HINT}"
+            return "。注意：请先用微信给 Bot 发一条消息完成绑定，定时提醒才能发到微信"
         return ""
 
     def session_context(self) -> str:
-        payload = self.status_payload()
-        if not payload:
+        failures = self._state.get("delivery_failures") or []
+        if not failures:
             return ""
-        parts: list[str] = []
-        if payload["context_stale"]:
-            parts.append(f"\n当前微信主动推送可能不可用：{STALE_USER_HINT}")
-        if payload["delivery_failures"]:
-            missed = "、".join(str(f["content"]) for f in payload["delivery_failures"])
-            parts.append(f"\n以下定时提醒没能发到微信：{missed}。若用户问起，说明原因并提醒：{STALE_USER_HINT}")
-        return "".join(parts)
+        missed = "、".join(str(f["content"]) for f in failures)
+        return f"\n以下定时提醒没能发到微信：{missed}。若用户问起，说明原因并提醒：{STALE_USER_HINT}"
 
     async def close(self) -> None:
         await self._http.aclose()
@@ -165,11 +104,6 @@ class WeChat:
     async def send(self, text: str, *, failure_meta: dict[str, Any] | None = None) -> None:
         if not self._state.get("context_token"):
             err = WeChatError("还没有绑定微信：请先用微信给 Bot 发一条消息")
-            if failure_meta:
-                self.record_delivery_failure(error=str(err), **failure_meta)
-            raise err
-        if self.is_context_stale():
-            err = WeChatError(f"微信会话可能已过期（{STALE_USER_HINT}）")
             if failure_meta:
                 self.record_delivery_failure(error=str(err), **failure_meta)
             raise err
@@ -193,18 +127,6 @@ class WeChat:
                 self.record_delivery_failure(error=str(e), **failure_meta)
             raise
 
-    async def maybe_nudge_expiring_context(self) -> None:
-        if not self.should_nudge_expiring_context():
-            return
-        token_at = self._state.get("context_token_at")
-        try:
-            await self.send(EXPIRY_NUDGE_REPLY)
-        except WeChatError:
-            log.warning("微信 session 即将过期提醒发送失败", exc_info=True)
-            return
-        self._save(context_nudge_for=token_at)
-        log.info("已发送微信 session 即将过期提醒")
-
     def _note_inbound_context(self, msg: dict[str, Any]) -> None:
         """用户发来微信消息时刷新 context_token，并清除已记录的投递失败。"""
         self._save(
@@ -212,7 +134,6 @@ class WeChat:
             context_token=msg["context_token"],
             context_token_at=_utc_now().isoformat(),
             delivery_failures=[],
-            context_nudge_for=None,
         )
 
     async def run(self) -> None:
@@ -223,21 +144,7 @@ class WeChat:
             await asyncio.sleep(LOGIN_CHECK_S)
             self._load()
         log.info("微信已登录，%s", "提醒会同时发到微信" if self._state.get("context_token") else "请用微信给 Bot 发一条消息完成绑定")
-        if self.is_context_stale():
-            log.warning("微信 context_token 可能已过期，主动推送会失败，直到用户给 Bot 发消息：%s", STALE_USER_HINT)
-        nudge_task = asyncio.create_task(self._run_expiry_nudge_loop())
-        try:
-            await self._run_updates_loop()
-        finally:
-            nudge_task.cancel()
-            with suppress(Exception):
-                await nudge_task
-
-    async def _run_expiry_nudge_loop(self) -> None:
-        while True:
-            self._load()
-            await self.maybe_nudge_expiring_context()
-            await asyncio.sleep(NUDGE_CHECK_S)
+        await self._run_updates_loop()
 
     async def _run_updates_loop(self) -> None:
         while True:
@@ -256,13 +163,7 @@ class WeChat:
             for msg in result.get("msgs") or []:
                 if msg.get("message_type") in (None, 1) and msg.get("from_user_id") and msg.get("context_token"):
                     is_new = msg["from_user_id"] != self._state.get("user_id")
-                    was_stale = not is_new and self.is_context_stale()
-                    token_at = self._state.get("context_token_at")
-                    replied_nudge = (
-                        not is_new
-                        and token_at
-                        and self._state.get("context_nudge_for") == token_at
-                    )
+                    had_failures = bool(not is_new and self._state.get("delivery_failures"))
                     self._note_inbound_context(msg)
                     if is_new:
                         log.info("微信已绑定: %s", msg["from_user_id"])
@@ -270,7 +171,7 @@ class WeChat:
                             await self.send(BIND_REPLY)
                         except Exception:
                             log.exception("微信回复失败")
-                    elif was_stale or replied_nudge:
+                    elif had_failures:
                         log.info("微信 context_token 已刷新")
                         try:
                             await self.send(REFRESH_REPLY)

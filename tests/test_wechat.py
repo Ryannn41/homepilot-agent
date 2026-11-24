@@ -25,7 +25,7 @@ async def test_run_waits_for_login_then_binds_sender(tmp_path, monkeypatch):
     monkeypatch.setattr(wechat, "_post", fake_post)
     task = asyncio.create_task(wechat.run())
     await asyncio.sleep(0.05)
-    assert posted == []  # 未登录时不请求
+    assert posted == []
     path.write_text(json.dumps({"bot_token": "b", "base_url": "https://x"}))
     await asyncio.sleep(0.1)
     task.cancel()
@@ -38,13 +38,13 @@ async def test_run_waits_for_login_then_binds_sender(tmp_path, monkeypatch):
     assert sent[0]["msg"]["item_list"][0]["text_item"]["text"] == BIND_REPLY
 
 
-async def test_send_blocks_stale_context_without_api_call(tmp_path, monkeypatch):
+async def test_send_uses_api_even_with_old_context_timestamp(tmp_path, monkeypatch):
     path = tmp_path / "wechat.json"
-    old = (datetime.now(timezone.utc) - timedelta(hours=7)).isoformat()
+    old = (datetime.now(timezone.utc) - timedelta(days=2)).isoformat()
     path.write_text(
         json.dumps({"bot_token": "b", "base_url": "https://x", "user_id": "u", "context_token": "t", "context_token_at": old})
     )
-    wechat = WeChat(path, context_max_age=timedelta(hours=6))
+    wechat = WeChat(path)
     posted = []
 
     async def fake_post(api, payload):
@@ -52,12 +52,8 @@ async def test_send_blocks_stale_context_without_api_call(tmp_path, monkeypatch)
         return {}
 
     monkeypatch.setattr(wechat, "_post", fake_post)
-    with pytest.raises(WeChatError, match="过期"):
-        await wechat.send("hi", failure_meta={"reminder_id": 1, "content": "健身"})
-    assert posted == []
-    state = json.loads(path.read_text())
-    assert len(state["delivery_failures"]) == 1
-    assert state["delivery_failures"][0]["content"] == "健身"
+    await wechat.send("hi")
+    assert len(posted) == 1
     await wechat.close()
 
 
@@ -80,80 +76,24 @@ async def test_prepare_failed_records_delivery_failure(tmp_path, monkeypatch):
     await wechat.close()
 
 
-def test_schedule_wechat_hint_when_stale(tmp_path):
+def test_schedule_wechat_hint_when_unbound(tmp_path):
     path = tmp_path / "wechat.json"
-    old = (datetime.now(timezone.utc) - timedelta(hours=7)).isoformat()
-    path.write_text(
-        json.dumps({"bot_token": "b", "base_url": "https://x", "user_id": "u", "context_token": "t", "context_token_at": old})
-    )
-    wechat = WeChat(path, context_max_age=timedelta(hours=6))
-    assert "很久没在微信" in wechat.schedule_wechat_hint()
-    assert wechat.schedule_wechat_hint().startswith("。注意：")
+    path.write_text(json.dumps({"bot_token": "b", "base_url": "https://x"}))
+    wechat = WeChat(path)
+    assert "发一条消息" in wechat.schedule_wechat_hint()
 
 
-def test_should_nudge_when_near_expiry(tmp_path):
+def test_schedule_wechat_hint_when_bound(tmp_path):
     path = tmp_path / "wechat.json"
-    almost = (datetime.now(timezone.utc) - timedelta(hours=5, minutes=30)).isoformat()
     path.write_text(
-        json.dumps({"bot_token": "b", "base_url": "https://x", "user_id": "u", "context_token": "t", "context_token_at": almost})
-    )
-    wechat = WeChat(path, context_max_age=timedelta(hours=6), context_nudge_before=timedelta(hours=1))
-    assert wechat.should_nudge_expiring_context() is True
-
-
-def test_should_not_nudge_when_fresh_or_stale(tmp_path):
-    path = tmp_path / "wechat.json"
-    fresh = datetime.now(timezone.utc).isoformat()
-    path.write_text(
-        json.dumps({"bot_token": "b", "base_url": "https://x", "user_id": "u", "context_token": "t", "context_token_at": fresh})
-    )
-    wechat = WeChat(path, context_max_age=timedelta(hours=6), context_nudge_before=timedelta(hours=1))
-    assert wechat.should_nudge_expiring_context() is False
-
-    old = (datetime.now(timezone.utc) - timedelta(hours=7)).isoformat()
-    path.write_text(
-        json.dumps({"bot_token": "b", "base_url": "https://x", "user_id": "u", "context_token": "t", "context_token_at": old})
-    )
-    wechat = WeChat(path, context_max_age=timedelta(hours=6), context_nudge_before=timedelta(hours=1))
-    assert wechat.should_nudge_expiring_context() is False
-
-
-async def test_nudge_sends_once_per_token_epoch(tmp_path, monkeypatch):
-    path = tmp_path / "wechat.json"
-    almost = (datetime.now(timezone.utc) - timedelta(hours=5, minutes=30)).isoformat()
-    path.write_text(
-        json.dumps({"bot_token": "b", "base_url": "https://x", "user_id": "u", "context_token": "t", "context_token_at": almost})
-    )
-    wechat = WeChat(path, context_max_age=timedelta(hours=6), context_nudge_before=timedelta(hours=1))
-    calls = 0
-
-    async def fake_post(api, payload):
-        nonlocal calls
-        calls += 1
-        return {}
-
-    monkeypatch.setattr(wechat, "_post", fake_post)
-    await wechat.maybe_nudge_expiring_context()
-    await wechat.maybe_nudge_expiring_context()
-    assert calls == 1
-    state = json.loads(path.read_text())
-    assert state["context_nudge_for"] == almost
-    await wechat.close()
-
-
-def test_schedule_wechat_hint_fresh(tmp_path):
-    path = tmp_path / "wechat.json"
-    fresh = datetime.now(timezone.utc).isoformat()
-    path.write_text(
-        json.dumps({"bot_token": "b", "base_url": "https://x", "user_id": "u", "context_token": "t", "context_token_at": fresh})
+        json.dumps({"bot_token": "b", "base_url": "https://x", "user_id": "u", "context_token": "t"})
     )
     wechat = WeChat(path)
     assert wechat.schedule_wechat_hint() == ""
 
 
-async def test_nudge_inbound_sends_refresh_reply_before_stale(tmp_path, monkeypatch):
+async def test_inbound_after_delivery_failure_sends_refresh_reply(tmp_path, monkeypatch):
     monkeypatch.setattr(wechat_module, "LOGIN_CHECK_S", 0.01)
-    almost = (datetime.now(timezone.utc) - timedelta(hours=5, minutes=30)).isoformat()
     path = tmp_path / "wechat.json"
     path.write_text(
         json.dumps(
@@ -162,39 +102,11 @@ async def test_nudge_inbound_sends_refresh_reply_before_stale(tmp_path, monkeypa
                 "base_url": "https://x",
                 "user_id": "u1",
                 "context_token": "t0",
-                "context_token_at": almost,
-                "context_nudge_for": almost,
+                "delivery_failures": [{"at": "x", "reminder_id": 1, "content": "健身", "error": "prepare failed"}],
             }
         )
     )
-    wechat = WeChat(path, context_max_age=timedelta(hours=6), context_nudge_before=timedelta(hours=1))
-    posted = []
-
-    async def fake_post(api, payload):
-        posted.append((api, payload))
-        if api.endswith("getupdates"):
-            return {"get_updates_buf": "c", "msgs": [{"message_type": 1, "from_user_id": "u1", "context_token": "t1"}]}
-        return {}
-
-    monkeypatch.setattr(wechat, "_post", fake_post)
-    task = asyncio.create_task(wechat.run())
-    await asyncio.sleep(0.05)
-    task.cancel()
-    await wechat.close()
-    sent = [p for api, p in posted if api.endswith("sendmessage")]
-    assert sent[0]["msg"]["item_list"][0]["text_item"]["text"] == REFRESH_REPLY
-
-
-async def test_stale_inbound_sends_refresh_reply(tmp_path, monkeypatch):
-    monkeypatch.setattr(wechat_module, "LOGIN_CHECK_S", 0.01)
-    old = (datetime.now(timezone.utc) - timedelta(hours=7)).isoformat()
-    path = tmp_path / "wechat.json"
-    path.write_text(
-        json.dumps(
-            {"bot_token": "b", "base_url": "https://x", "user_id": "u1", "context_token": "t0", "context_token_at": old}
-        )
-    )
-    wechat = WeChat(path, context_max_age=timedelta(hours=6))
+    wechat = WeChat(path)
     posted = []
 
     async def fake_post(api, payload):
